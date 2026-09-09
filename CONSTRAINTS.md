@@ -41,9 +41,14 @@ it here first, in its own commit, with a reason.
 
 ## Security standards
 
-- Output filenames are sanitized: `derive_filename` strips all directory
-  separators, so a hostile `Content-Disposition` or URL cannot write outside
-  the chosen output directory. Do not bypass it.
+- Output filenames are reduced to a safe basename by `derive_filename`: it drops
+  directory separators and any NTFS alternate-data-stream (`:`) suffix, strips
+  control characters and trailing dots/spaces, and falls back to `download.bin`
+  for an empty result, `.`/`..`, or a Windows reserved device name. A hostile
+  `Content-Disposition` or URL therefore cannot write outside the chosen output
+  directory. Do not bypass it. (Deeper containment — symlink/realpath checks on
+  the output directory itself — is a Milestone 2 obligation, tracked in the
+  milestone-2 security notes.)
 - (Milestone 2, when it lands) the local service binds to `127.0.0.1` only and
   requires a shared secret token on every request — any web page in the
   browser can also reach a localhost port.
