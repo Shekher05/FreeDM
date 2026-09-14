@@ -1,4 +1,4 @@
-# myIDM
+# TDM
 
 A tiny personal download accelerator, built to learn. For a real tool use
 [Motrix](https://motrix.app), [aria2](https://aria2.github.io/), or a browser
@@ -9,7 +9,7 @@ work, not to compete with them.
 
 Downloads one file over several parallel HTTP connections, each fetching a
 different byte range, then writes them into one preallocated `.part` file at the
-right offsets. Per-segment progress is flushed to a `<name>.myidm.json` sidecar
+right offsets. Per-segment progress is flushed to a `<name>.tdm.json` sidecar
 about once a second, so an interrupted download **resumes on re-run** instead of
 starting over. If the server does not support range requests (or does not report
 a size), it falls back to a single streamed connection.
@@ -32,9 +32,9 @@ Python 3.11+ is required.
 ## Usage
 
 ```bash
-python -m myidm https://example.com/big.iso              # 8 segments (default)
-python -m myidm https://example.com/big.iso -n 16        # 16 parallel connections
-python -m myidm https://example.com/big.iso -o downloads # write into ./downloads
+python -m tdm https://example.com/big.iso              # 8 segments (default)
+python -m tdm https://example.com/big.iso -n 16        # 16 parallel connections
+python -m tdm https://example.com/big.iso -o downloads # write into ./downloads
 ```
 
 A `\r`-updated line shows a bar, percent, speed, and ETA (speed comes straight
@@ -47,13 +47,13 @@ from error output.
 ## How resume works
 
 - While downloading, each segment's byte count is written to
-  `<name>.myidm.json` next to the output.
+  `<name>.tdm.json` next to the output.
 - On a re-run, that sidecar is trusted **only if** the URL, the total size, and
   a non-empty strong validator (`ETag`, else `Last-Modified`) all still match.
   If the file on the server changed, the sidecar is ignored and the download
   restarts clean — no corruption.
 - Finished segments are not re-fetched; only the remaining bytes are pulled.
-- On success both `<name>.part` and `<name>.myidm.json` are deleted.
+- On success both `<name>.part` and `<name>.tdm.json` are deleted.
 
 **Durability scope:** resume survives Ctrl-C and a process restart. It does
 **not** survive a hard power loss — the sidecar write is atomic (temp file +
@@ -70,20 +70,20 @@ ruff check .
 
 ## Running as a background service (Milestone 2)
 
-For downloads that outlive a single `python -m myidm <url>` invocation — pause,
-resume, cancel, or several queued at once — run myIDM as a small local service
+For downloads that outlive a single `python -m tdm <url>` invocation — pause,
+resume, cancel, or several queued at once — run TDM as a small local service
 instead:
 
 ```bash
-python -m myidm serve                              # starts a detached background process
-python -m myidm add https://example.com/big.iso     # queues a download, prints its id
-python -m myidm add https://example.com/big.iso -o downloads -n 16
-python -m myidm status                              # table: id, state, percent, filename
-python -m myidm status <id> --json                  # one download, raw JSON
-python -m myidm pause <id>
-python -m myidm resume <id>
-python -m myidm cancel <id>
-python -m myidm stop                                # graceful shutdown
+python -m tdm serve                              # starts a detached background process
+python -m tdm add https://example.com/big.iso     # queues a download, prints its id
+python -m tdm add https://example.com/big.iso -o downloads -n 16
+python -m tdm status                              # table: id, state, percent, filename
+python -m tdm status <id> --json                  # one download, raw JSON
+python -m tdm pause <id>
+python -m tdm resume <id>
+python -m tdm cancel <id>
+python -m tdm stop                                # graceful shutdown
 ```
 
 `serve` is idempotent — running it again while a service is already up just
@@ -95,8 +95,8 @@ Ctrl-C: a `queued`/`running`/`paused` entry on disk is picked back up and
 resumed (via the same segment-sidecar resume that powers the one-shot CLI) the
 next time `serve` runs.
 
-**Where state lives:** `%LOCALAPPDATA%\myidm` on Windows, else
-`$XDG_STATE_HOME/myidm` (or `~/.local/state/myidm`) — `queue.json` (the
+**Where state lives:** `%LOCALAPPDATA%\tdm` on Windows, else
+`$XDG_STATE_HOME/tdm` (or `~/.local/state/tdm`) — `queue.json` (the
 download list; URLs there always have any embedded credentials stripped),
 `service.port`, `service.token`, `service.pid`, and `service.log` (the
 detached process's stdout/stderr).

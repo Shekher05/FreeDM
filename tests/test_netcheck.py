@@ -2,7 +2,7 @@ import socket
 
 import pytest
 
-from myidm.netcheck import BlockedURLError, assert_allowed_url
+from tdm.netcheck import BlockedURLError, assert_allowed_url
 
 
 @pytest.mark.parametrize(

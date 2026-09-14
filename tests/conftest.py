@@ -23,7 +23,7 @@ import threading
 
 import pytest
 
-from myidm import netcheck
+from tdm import netcheck
 
 
 @pytest.fixture(autouse=True)

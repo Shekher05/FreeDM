@@ -7,8 +7,8 @@ from pathlib import Path
 import pytest
 import requests
 
-from myidm import engine, netcheck
-from myidm.engine import (
+from tdm import engine, netcheck
+from tdm.engine import (
     CHUNK,
     Cancelled,
     InsufficientSpace,
@@ -25,8 +25,8 @@ from myidm.engine import (
     download,
     split_ranges,
 )
-from myidm.netcheck import BlockedURLError
-from myidm.netcheck import assert_allowed_url as _real_assert_allowed_url
+from tdm.netcheck import BlockedURLError
+from tdm.netcheck import assert_allowed_url as _real_assert_allowed_url
 
 
 class _FakeResp:
@@ -102,17 +102,17 @@ def test_split_ranges_rejects_zero():
 def test_sidecar_paths():
     final = Path("/tmp/movie.mkv")
     assert _part_path(final).name == "movie.mkv.part"
-    assert _meta_path(final).name == "movie.mkv.myidm.json"
+    assert _meta_path(final).name == "movie.mkv.tdm.json"
 
 
 def test_progress_round_trip(tmp_path):
-    meta = tmp_path / "f.myidm.json"
+    meta = tmp_path / "f.tdm.json"
     _save_progress(meta, "http://h/f", 100, '"e1"', [10, 20, 0])
     assert _load_progress(meta, "http://h/f", 100, '"e1"') == [10, 20, 0]
 
 
 def test_progress_rejected_on_mismatch(tmp_path):
-    meta = tmp_path / "f.myidm.json"
+    meta = tmp_path / "f.tdm.json"
     _save_progress(meta, "http://h/f", 100, '"e1"', [10, 20, 0])
     assert _load_progress(meta, "http://h/f", 999, '"e1"') is None
     assert _load_progress(meta, "http://h/OTHER", 100, '"e1"') is None
@@ -120,13 +120,13 @@ def test_progress_rejected_on_mismatch(tmp_path):
 
 
 def test_progress_rejected_without_strong_validator(tmp_path):
-    meta = tmp_path / "f.myidm.json"
+    meta = tmp_path / "f.tdm.json"
     _save_progress(meta, "http://h/f", 100, "", [10, 20, 0])
     assert _load_progress(meta, "http://h/f", 100, "") is None
 
 
 def test_progress_rejected_on_out_of_range_entry(tmp_path):
-    meta = tmp_path / "f.myidm.json"
+    meta = tmp_path / "f.tdm.json"
     # split_ranges(100, 3)[0] is (0, 32) -> length 33; 999 and -1 are impossible.
     meta.write_text(json.dumps({"url": "http://h/f", "size": 100, "etag": "e", "progress": [999, 0, 0]}))
     assert _load_progress(meta, "http://h/f", 100, "e") is None
@@ -138,26 +138,26 @@ def test_progress_rejected_on_out_of_range_entry(tmp_path):
 
 def test_progress_missing_or_corrupt_file(tmp_path):
     assert _load_progress(tmp_path / "nope.json", "u", 1, "e") is None
-    bad = tmp_path / "bad.myidm.json"
+    bad = tmp_path / "bad.tdm.json"
     bad.write_text("{not json")
     assert _load_progress(bad, "u", 1, "e") is None
 
 
 def test_save_progress_is_atomic(tmp_path):
-    meta = tmp_path / "f.myidm.json"
+    meta = tmp_path / "f.tdm.json"
     _save_progress(meta, "http://h/f", 100, "e", [1, 2, 3])
-    assert not (tmp_path / "f.myidm.json.tmp").exists()
+    assert not (tmp_path / "f.tdm.json.tmp").exists()
 
 
 def test_stale_tmp_does_not_affect_load(tmp_path):
-    meta = tmp_path / "f.myidm.json"
+    meta = tmp_path / "f.tdm.json"
     _save_progress(meta, "http://h/f", 100, "e", [10, 20, 0])
-    (tmp_path / "f.myidm.json.tmp").write_text("garbage from a crash")
+    (tmp_path / "f.tdm.json.tmp").write_text("garbage from a crash")
     assert _load_progress(meta, "http://h/f", 100, "e") == [10, 20, 0]
 
 
 def test_sidecar_never_persists_credentials(tmp_path):
-    meta = tmp_path / "f.myidm.json"
+    meta = tmp_path / "f.tdm.json"
     _save_progress(meta, "http://user:s3cret@h/f", 100, "e", [0])
     raw = meta.read_text()
     assert "s3cret" not in raw
@@ -238,7 +238,7 @@ def test_probe_rejects_non_http_redirect(monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr("myidm.engine._session.get", lambda *a, **k: _FtpResp())
+    monkeypatch.setattr("tdm.engine._session.get", lambda *a, **k: _FtpResp())
     monkeypatch.setattr(netcheck, "assert_allowed_url", _real_assert_allowed_url)
     with pytest.raises(ValueError, match="non-http"):
         _probe("http://start/redirect-away")
@@ -256,7 +256,7 @@ def test_probe_rejects_private_redirect(monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr("myidm.engine._session.get", lambda *a, **k: _PrivateResp())
+    monkeypatch.setattr("tdm.engine._session.get", lambda *a, **k: _PrivateResp())
     monkeypatch.setattr(netcheck, "assert_allowed_url", _real_assert_allowed_url)
     with pytest.raises(BlockedURLError):
         _probe("http://start/redirect-away")
@@ -458,7 +458,7 @@ def test_probe_survives_unknown_content_range_total(monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr("myidm.engine._session.get", lambda *a, **k: _Resp())
+    monkeypatch.setattr("tdm.engine._session.get", lambda *a, **k: _Resp())
     assert _probe("http://h/f.bin").size == 0  # no crash on int("*")
 
 
@@ -479,7 +479,7 @@ def test_download_single_rejects_a_truncated_stream(monkeypatch, tmp_path):
         def iter_content(self, n):
             yield b"only a few bytes"
 
-    monkeypatch.setattr("myidm.engine._session.get", lambda *a, **k: _Resp())
+    monkeypatch.setattr("tdm.engine._session.get", lambda *a, **k: _Resp())
     final = tmp_path / "f.bin"
     with pytest.raises(IntegrityError):
         _download_single("http://h/f.bin", final, 1_000_000, None)
@@ -509,7 +509,7 @@ def test_segment_does_not_retry_client_errors(monkeypatch, tmp_path):
         calls.append(1)
         return _Resp()
 
-    monkeypatch.setattr("myidm.engine._session.get", fake_get)
+    monkeypatch.setattr("tdm.engine._session.get", fake_get)
     part = tmp_path / "f.part"
     part.write_bytes(b"\x00" * 11)
     with pytest.raises(requests.HTTPError):

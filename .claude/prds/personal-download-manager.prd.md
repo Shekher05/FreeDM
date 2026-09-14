@@ -1,5 +1,8 @@
 # Personal Download Manager (myIDM)
 
+> **Project renamed `myidm` -> `tdm` (TDM, Terminal Download Manager) on
+> 2026-09-15; the rest of this doc refers to the old name.**
+
 > **Base PRD.** This is the project's source-of-truth requirements document.
 > When requirements change, revise this file — not the plans derived from it.
 

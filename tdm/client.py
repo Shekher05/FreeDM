@@ -2,13 +2,13 @@
 
 import requests
 
-from myidm import service
+from tdm import service
 
 
 def endpoint() -> tuple[str, str]:
     ep = service.read_endpoint()
     if ep is None:
-        raise SystemExit("myidm service not running - run: myidm serve")
+        raise SystemExit("tdm service not running - run: tdm serve")
     return ep
 
 

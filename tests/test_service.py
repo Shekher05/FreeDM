@@ -6,11 +6,11 @@ import time
 import pytest
 import requests
 
-from myidm import netcheck, paths, service
-from myidm.engine import InsufficientSpace
-from myidm.netcheck import BlockedURLError
-from myidm.netcheck import assert_allowed_url as _real_assert_allowed_url
-from myidm.service import PERSIST_FIELDS, Manager, serve_in_thread
+from tdm import netcheck, paths, service
+from tdm.engine import InsufficientSpace
+from tdm.netcheck import BlockedURLError
+from tdm.netcheck import assert_allowed_url as _real_assert_allowed_url
+from tdm.service import PERSIST_FIELDS, Manager, serve_in_thread
 
 
 def _poll(mgr, id_, states, timeout=10.0):
@@ -90,7 +90,7 @@ def test_download_completes_and_checksum_matches(tmp_path, make_server):
         out = dl_dir / snap["filename"]
         assert out.read_bytes() == blob
         assert not out.with_name(out.name + ".part").exists()
-        assert not out.with_name(out.name + ".myidm.json").exists()
+        assert not out.with_name(out.name + ".tdm.json").exists()
     finally:
         mgr.shutdown()
 
@@ -102,7 +102,7 @@ def test_hard_error_sets_error_state(tmp_path, make_server, monkeypatch):
     def boom(*a, **k):
         raise InsufficientSpace("no room")
 
-    monkeypatch.setattr("myidm.engine.download", boom)
+    monkeypatch.setattr("tdm.engine.download", boom)
     id_ = mgr.add(server.url)
     mgr.start()
     try:
@@ -120,7 +120,7 @@ def test_error_message_is_redacted(tmp_path, make_server, monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("http://user:pw@h/x failed")
 
-    monkeypatch.setattr("myidm.engine.download", boom)
+    monkeypatch.setattr("tdm.engine.download", boom)
     id_ = mgr.add(server.url)
     mgr.start()
     try:
@@ -191,7 +191,7 @@ def test_cancel_deletes_files(tmp_path, make_server, monkeypatch):
         snap = _poll(mgr, id_, {"cancelled"})
         assert snap["state"] == "cancelled"
         assert not (dl_dir / "file.bin.part").exists()
-        assert not (dl_dir / "file.bin.myidm.json").exists()
+        assert not (dl_dir / "file.bin.tdm.json").exists()
     finally:
         mgr.shutdown()
 
@@ -255,7 +255,7 @@ def test_restart_keeps_done_entries(tmp_path, monkeypatch):
     def boom(*a, **k):
         raise AssertionError("engine.download should not run for a done entry")
 
-    monkeypatch.setattr("myidm.engine.download", boom)
+    monkeypatch.setattr("tdm.engine.download", boom)
     state_path = tmp_path / "queue.json"
     _write_queue(state_path, [
         {"id": "d1", "url": "http://h/f", "dest_dir": ".", "segments": 8,

@@ -2,7 +2,7 @@
 
 ## What this is
 
-**myIDM** — a personal, command-line download accelerator written in Python. A
+**TDM** — a personal, command-line download accelerator written in Python. A
 stripped-down Internet Download Manager for one user (the project owner).
 
 ## Why it exists
@@ -27,7 +27,7 @@ understand how it works by building it. The learning targets:
 
 ## How it works (one paragraph)
 
-A normal browser download uses one connection. myIDM opens several connections
+A normal browser download uses one connection. TDM opens several connections
 to the same file at once, each requesting a different byte range with an HTTP
 `Range` header, and writes each range to its correct offset in a preallocated
 file. Per-segment progress is written to a small JSON sidecar continuously, so
@@ -38,7 +38,7 @@ fall back to a single streamed connection.
 
 | # | Milestone | Outcome |
 |---|-----------|---------|
-| 1 | Segmented engine + CLI | `python -m myidm <url>` gives a fast, resumable download with live progress |
+| 1 | Segmented engine + CLI | `python -m tdm <url>` gives a fast, resumable download with live progress |
 | 2 | Local background service | Engine runs in the background, accepts URLs over a `127.0.0.1` endpoint, keeps a persistent queue, reports status |
 | 3 | Chrome extension | Right-click a link in Chrome to send it to the service; an extension popup shows progress |
 

@@ -10,10 +10,10 @@ def state_dir() -> Path:
     """Where the service keeps its queue, port, token, and pid files."""
     if sys.platform.startswith("win"):
         local = os.environ.get("LOCALAPPDATA")
-        d = Path(local) / "myidm" if local else Path.home() / ".myidm"
+        d = Path(local) / "tdm" if local else Path.home() / ".tdm"
     else:
         base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
-        d = Path(base) / "myidm"
+        d = Path(base) / "tdm"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -38,4 +38,4 @@ def read_or_none(path: Path) -> str | None:
 
 def default_download_dir() -> Path:
     """Not created here - the caller (the download itself) creates it on use."""
-    return Path.home() / "Downloads" / "myidm"
+    return Path.home() / "Downloads" / "tdm"

@@ -1,8 +1,8 @@
 import os
 
-from myidm import __main__ as cli
-from myidm import client
-from myidm.__main__ import _redact, main
+from tdm import __main__ as cli
+from tdm import client
+from tdm.__main__ import _redact, main
 
 
 def test_cli_downloads_file(make_server, tmp_path, capsys):
@@ -45,11 +45,11 @@ def test_redact_catches_credentials_glued_to_punctuation():
 
 
 def test_add_without_service_exits_cleanly(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr("myidm.service.read_endpoint", lambda: None)
+    monkeypatch.setattr("tdm.service.read_endpoint", lambda: None)
     rc = main(["add", "http://x/"])
     assert rc != 0
     err = capsys.readouterr().err
-    assert "myidm serve" in err
+    assert "tdm serve" in err
     assert "Traceback" not in err
 
 

@@ -20,7 +20,7 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 
 import requests
 
-from myidm import netcheck
+from tdm import netcheck
 
 CHUNK = 65536
 SEGMENT_RETRIES = 5
@@ -129,7 +129,7 @@ def _probe(url: str) -> ProbeResult:
 # --- resume sidecar ---------------------------------------------------------
 #
 # Two files sit next to the output: ``<name>.part`` (the bytes, preallocated to
-# full size) and ``<name>.myidm.json`` (this sidecar). The sidecar is exactly
+# full size) and ``<name>.tdm.json`` (this sidecar). The sidecar is exactly
 # ``{"url": str, "size": int, "etag": str, "progress": [int, ...]}`` where each
 # int is bytes completed for that segment. A load is trusted only when url, size
 # and a *non-empty* etag all match the current probe.
@@ -142,7 +142,7 @@ def _part_path(final: Path) -> Path:
 
 
 def _meta_path(final: Path) -> Path:
-    return final.with_name(final.name + ".myidm.json")
+    return final.with_name(final.name + ".tdm.json")
 
 
 def _sidecar_url(url: str) -> str:

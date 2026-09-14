@@ -1,4 +1,4 @@
-"""``python -m myidm <url> [-n SEGMENTS] [-o OUTPUT_DIR]`` - the CLI front end.
+"""``python -m tdm <url> [-n SEGMENTS] [-o OUTPUT_DIR]`` - the CLI front end.
 
 Rendering only. The engine reports progress through
 ``progress_cb(done, total, bytes_per_sec)`` and this module formats it; there is
@@ -10,8 +10,8 @@ import argparse
 import json
 import sys
 
-from myidm.engine import download
-from myidm.redact import redact
+from tdm.engine import download
+from tdm.redact import redact
 
 _redact = redact  # kept for tests/test_cli.py's existing import name
 
@@ -40,9 +40,9 @@ _SERVICE_SUBCOMMANDS = {"serve", "_serve", "stop", "add", "status", "cancel", "p
 
 
 def _cmd_add(rest: list[str]) -> int:
-    from myidm import client
+    from tdm import client
 
-    p = argparse.ArgumentParser(prog="myidm add")
+    p = argparse.ArgumentParser(prog="tdm add")
     p.add_argument("url")
     p.add_argument("-n", "--segments", type=int, default=8)
     p.add_argument("-o", "--output-dir", default=None)
@@ -60,9 +60,9 @@ def _cmd_add(rest: list[str]) -> int:
 
 
 def _cmd_status(rest: list[str]) -> int:
-    from myidm import client
+    from tdm import client
 
-    p = argparse.ArgumentParser(prog="myidm status")
+    p = argparse.ArgumentParser(prog="tdm status")
     p.add_argument("id", nargs="?")
     p.add_argument("--json", action="store_true")
     args = p.parse_args(rest)
@@ -82,9 +82,9 @@ def _cmd_status(rest: list[str]) -> int:
 
 
 def _cmd_action(cmd: str, rest: list[str]) -> int:
-    from myidm import client
+    from tdm import client
 
-    p = argparse.ArgumentParser(prog=f"myidm {cmd}")
+    p = argparse.ArgumentParser(prog=f"tdm {cmd}")
     p.add_argument("id")
     args = p.parse_args(rest)
 
@@ -97,7 +97,7 @@ def _cmd_action(cmd: str, rest: list[str]) -> int:
 
 
 def _run_service_subcommand(cmd: str, rest: list[str]) -> int:
-    from myidm import service
+    from tdm import service
 
     try:
         if cmd == "serve":
@@ -123,7 +123,7 @@ def _run_service_subcommand(cmd: str, rest: list[str]) -> int:
 
 def _one_shot(argv: list[str] | None) -> int:
     p = argparse.ArgumentParser(
-        prog="myidm", description="Segmented HTTP downloader with resume."
+        prog="tdm", description="Segmented HTTP downloader with resume."
     )
     p.add_argument("url")
     p.add_argument(

@@ -22,8 +22,8 @@ from urllib.parse import urlsplit
 
 import requests
 
-from myidm import __version__, engine, netcheck, paths
-from myidm.redact import redact, strip_credentials
+from tdm import __version__, engine, netcheck, paths
+from tdm.redact import redact, strip_credentials
 
 PERSIST_FIELDS = ("id", "url", "dest_dir", "segments", "state", "filename", "error")
 _TERMINAL_STATES = {"done", "error", "cancelled"}
@@ -435,7 +435,7 @@ def _clear_state_files(d: Path) -> None:
 
 def run_service() -> None:
     """Blocking: run the HTTP service in the foreground until shutdown (via
-    `POST /shutdown` or SIGTERM/SIGBREAK). This is what `python -m myidm
+    `POST /shutdown` or SIGTERM/SIGBREAK). This is what `python -m tdm
     _serve` execs as a detached child."""
     d = paths.state_dir()
     token = secrets.token_urlsafe(32)
@@ -492,7 +492,7 @@ def spawn_detached() -> str:
         kwargs["start_new_session"] = True
     with open(d / "service.log", "ab") as log_fh:
         subprocess.Popen(
-            [sys.executable, "-m", "myidm", "_serve"],
+            [sys.executable, "-m", "tdm", "_serve"],
             stdin=subprocess.DEVNULL,
             stdout=log_fh,
             stderr=log_fh,

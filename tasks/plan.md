@@ -1,5 +1,8 @@
 # Implementation Plan: Milestone 1 engine — council-revised task list
 
+> **Project renamed `myidm` -> `tdm` (TDM, Terminal Download Manager) on
+> 2026-09-15; the rest of this doc refers to the old name.**
+
 ## Overview
 
 This plan revises the remaining work in the original 2026-09-07 implementation
