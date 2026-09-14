@@ -8,3 +8,9 @@ __pycache__/
 
 # Local Claude Code state
 .claude/settings.local.json
+.claude
+docs
+tasks
+SESSION_GUIDE.md
+PROJECT.md
+CONSTRAINTS.md
