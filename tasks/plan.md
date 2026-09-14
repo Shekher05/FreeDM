@@ -2,10 +2,10 @@
 
 ## Overview
 
-This plan revises the remaining work in
-[`docs/superpowers/plans/2026-09-07-myidm-segmented-engine.md`](../docs/superpowers/plans/2026-09-07-myidm-segmented-engine.md)
-using the local-council review saved at
-[`.claude/council-cache/local-council.md`](../.claude/council-cache/local-council.md).
+This plan revises the remaining work in the original 2026-09-07 implementation
+plan (fully superseded by this document; removed 2026-09-11 as redundant)
+using a local-council review of that plan (review transcript also removed
+2026-09-11 - its conclusions are folded into this document).
 
 Tasks 1–2 of the original plan (`split_ranges`, `derive_filename`) are already
 implemented. `split_ranges` is committed; `derive_filename` is in the working
@@ -18,8 +18,9 @@ only when `python -m pytest -q` and `ruff check .` are both green.
 
 ## Revision 2 — local council, 2026-09-09
 
-A second local council (`.claude/council-cache/local-council-1788960321.md`)
-reviewed this plan. Verdict from all three lenses: **proceed, with changes** —
+A second local council (review transcript removed 2026-09-11 as redundant -
+its conclusions are folded into the deltas below) reviewed this plan. Verdict
+from all three lenses: **proceed, with changes** —
 no one wanted to stop or rethink. Deltas, folded into the tasks below:
 
 **Add (correctness / security):**
@@ -121,7 +122,9 @@ in the same commit.
 
 ## Task List
 
-See [`todo.md`](todo.md) for full acceptance criteria and verification steps.
+(The original per-task acceptance-criteria doc, `todo.md`, was removed
+2026-09-11 as redundant now that M1 is code-complete; see `SESSION_GUIDE.md`
+for what was implemented.)
 
 ### Phase 1: Foundation (pure functions + resume state)
 - [ ] Task 1: Harden `derive_filename`, then commit
@@ -158,7 +161,8 @@ See [`todo.md`](todo.md) for full acceptance criteria and verification steps.
 
 ### Checkpoint: Complete
 - [ ] All acceptance criteria met
-- [ ] `docs/superpowers/plans/2026-09-07-myidm-segmented-engine.md` open questions marked resolved
+- [x] Original 2026-09-07 plan's two open questions (reboot-vs-restart, testing
+  no-range servers) resolved — see `SESSION_GUIDE.md` Task 9 notes
 - [ ] Ready for review / merge to `main`
 
 ## Risks and Mitigations

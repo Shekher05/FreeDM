@@ -52,7 +52,7 @@ browser-to-app bridge work.
 
 ## Related documents
 
-- [`.claude/prds/personal-download-manager.prd.md`](.claude/prds/personal-download-manager.prd.md) — full product requirements.
-- [`docs/superpowers/plans/2026-09-07-myidm-segmented-engine.md`](docs/superpowers/plans/2026-09-07-myidm-segmented-engine.md) — milestone 1 implementation plan.
+- [`.claude/prds/personal-download-manager.prd.md`](.claude/prds/personal-download-manager.prd.md) — the base PRD (source-of-truth requirements).
+- [`tasks/plan.md`](tasks/plan.md) — milestone 1 implementation plan (council-revised, Revision 2).
 - [`CONSTRAINTS.md`](CONSTRAINTS.md) — architectural invariants and rules.
 - [`CLAUDE.md`](CLAUDE.md) — commands and workflow for agents.

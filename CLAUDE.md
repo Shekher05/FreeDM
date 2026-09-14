@@ -1,71 +1,55 @@
-# CLAUDE.md
+CLAUDE.md
+Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
 
-Guidance for Claude Code (and other agents) working in this repository.
+Tradeoff: These guidelines bias toward caution over speed. For trivial tasks, use judgment.
 
-## What this project is
+1. Think Before Coding
+Don't assume. Don't hide confusion. Surface tradeoffs.
 
-myIDM — a personal, build-to-learn segmented download manager in Python. See
-[`PROJECT.md`](PROJECT.md) for the domain overview and
-[`.claude/prds/personal-download-manager.prd.md`](.claude/prds/personal-download-manager.prd.md)
-for requirements.
+Before implementing:
 
-## Source-of-truth documents
+State your assumptions explicitly. If uncertain, ask.
+If multiple interpretations exist, present them - don't pick silently.
+If a simpler approach exists, say so. Push back when warranted.
+If something is unclear, stop. Name what's confusing. Ask.
+2. Simplicity First
+Minimum code that solves the problem. Nothing speculative.
 
-- [`PROJECT.md`](PROJECT.md) — what and why.
-- [`CONSTRAINTS.md`](CONSTRAINTS.md) — architectural invariants, forbidden
-  dependencies, security standards, Git conventions. **Read it before making
-  changes. Never weaken a constraint to make a change pass.**
-- [`docs/superpowers/plans/2026-09-07-myidm-segmented-engine.md`](docs/superpowers/plans/2026-09-07-myidm-segmented-engine.md)
-  — the current implementation plan (milestone 1).
+No features beyond what was asked.
+No abstractions for single-use code.
+No "flexibility" or "configurability" that wasn't requested.
+No error handling for impossible scenarios.
+If you write 200 lines and it could be 50, rewrite it.
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
 
-## Environment
+3. Surgical Changes
+Touch only what you must. Clean up only your own mess.
 
-- Python 3.11+ (required — code uses `X | None` syntax and `unlink(missing_ok=)`).
-- Windows is the primary dev platform; keep everything cross-platform.
+When editing existing code:
 
-## Setup
+Don't "improve" adjacent code, comments, or formatting.
+Don't refactor things that aren't broken.
+Match existing style, even if you'd do it differently.
+If you notice unrelated dead code, mention it - don't delete it.
+When your changes create orphans:
 
-```bash
-python -m venv .venv
-.venv\Scripts\activate          # Windows;  source .venv/bin/activate elsewhere
-pip install -r requirements.txt
-pip install pytest ruff
-```
+Remove imports/variables/functions that YOUR changes made unused.
+Don't remove pre-existing dead code unless asked.
+The test: Every changed line should trace directly to the user's request.
 
-## Commands
+4. Goal-Driven Execution
+Define success criteria. Loop until verified.
 
-| Task | Command |
-|------|---------|
-| Build | none — pure Python, no build step |
-| Run | `python -m myidm <url> [-n SEGMENTS] [-o OUTPUT_DIR]` |
-| Test | `python -m pytest -q` |
-| Single test | `python -m pytest tests/test_engine.py::test_name -q` |
-| Lint | `ruff check .` |
-| Format | `ruff format .` |
+Transform tasks into verifiable goals:
 
-There is no dev server. Tests must not hit the network — they use the local
-HTTP server fixture in `tests/conftest.py`.
+"Add validation" → "Write tests for invalid inputs, then make them pass"
+"Fix the bug" → "Write a test that reproduces it, then make it pass"
+"Refactor X" → "Ensure tests pass before and after"
+For multi-step tasks, state a brief plan:
 
-## Workflow
+1. [Step] → verify: [check]
+2. [Step] → verify: [check]
+3. [Step] → verify: [check]
+Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
 
-- TDD for non-trivial logic: failing test first, then implementation (see the
-  plan — each task is structured this way).
-- One plan task per commit; commit only when `pytest` and `ruff check` pass.
-- Conventional Commit messages (`feat:`, `fix:`, `test:`, `docs:`).
-- Commit trailer: `Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>`.
-
-## Layout
-
-```
-myidm/
-  __init__.py      version only
-  engine.py        pure library: probe, split, segmented download, resume, fallback
-  __main__.py      argparse CLI + progress rendering (no engine logic here)
-tests/
-  conftest.py      make_server fixture (local range-capable HTTP server)
-  test_engine.py   engine unit + integration tests
-  test_cli.py      CLI end-to-end test
-```
-
-Keep engine logic out of `__main__.py` and UI concerns out of `engine.py` (see
-`CONSTRAINTS.md`).
+These guidelines are working if: fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.

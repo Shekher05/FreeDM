@@ -1,8 +1,32 @@
+import json
+import os
+import threading
 from itertools import pairwise
+from pathlib import Path
 
 import pytest
+import requests
 
-from myidm.engine import derive_filename, split_ranges
+from myidm import engine, netcheck
+from myidm.engine import (
+    CHUNK,
+    Cancelled,
+    InsufficientSpace,
+    IntegrityError,
+    RangeNotSupported,
+    _download_segmented,
+    _download_single,
+    _load_progress,
+    _meta_path,
+    _part_path,
+    _probe,
+    _save_progress,
+    derive_filename,
+    download,
+    split_ranges,
+)
+from myidm.netcheck import BlockedURLError
+from myidm.netcheck import assert_allowed_url as _real_assert_allowed_url
 
 
 class _FakeResp:
@@ -73,3 +97,558 @@ def test_split_ranges_more_segments_than_bytes():
 def test_split_ranges_rejects_zero():
     with pytest.raises(ValueError):
         split_ranges(0, 4)
+
+
+def test_sidecar_paths():
+    final = Path("/tmp/movie.mkv")
+    assert _part_path(final).name == "movie.mkv.part"
+    assert _meta_path(final).name == "movie.mkv.myidm.json"
+
+
+def test_progress_round_trip(tmp_path):
+    meta = tmp_path / "f.myidm.json"
+    _save_progress(meta, "http://h/f", 100, '"e1"', [10, 20, 0])
+    assert _load_progress(meta, "http://h/f", 100, '"e1"') == [10, 20, 0]
+
+
+def test_progress_rejected_on_mismatch(tmp_path):
+    meta = tmp_path / "f.myidm.json"
+    _save_progress(meta, "http://h/f", 100, '"e1"', [10, 20, 0])
+    assert _load_progress(meta, "http://h/f", 999, '"e1"') is None
+    assert _load_progress(meta, "http://h/OTHER", 100, '"e1"') is None
+    assert _load_progress(meta, "http://h/f", 100, '"e2"') is None
+
+
+def test_progress_rejected_without_strong_validator(tmp_path):
+    meta = tmp_path / "f.myidm.json"
+    _save_progress(meta, "http://h/f", 100, "", [10, 20, 0])
+    assert _load_progress(meta, "http://h/f", 100, "") is None
+
+
+def test_progress_rejected_on_out_of_range_entry(tmp_path):
+    meta = tmp_path / "f.myidm.json"
+    # split_ranges(100, 3)[0] is (0, 32) -> length 33; 999 and -1 are impossible.
+    meta.write_text(json.dumps({"url": "http://h/f", "size": 100, "etag": "e", "progress": [999, 0, 0]}))
+    assert _load_progress(meta, "http://h/f", 100, "e") is None
+    meta.write_text(json.dumps({"url": "http://h/f", "size": 100, "etag": "e", "progress": [-1, 0, 0]}))
+    assert _load_progress(meta, "http://h/f", 100, "e") is None
+    meta.write_text(json.dumps({"url": "http://h/f", "size": 100, "etag": "e", "progress": "notalist"}))
+    assert _load_progress(meta, "http://h/f", 100, "e") is None
+
+
+def test_progress_missing_or_corrupt_file(tmp_path):
+    assert _load_progress(tmp_path / "nope.json", "u", 1, "e") is None
+    bad = tmp_path / "bad.myidm.json"
+    bad.write_text("{not json")
+    assert _load_progress(bad, "u", 1, "e") is None
+
+
+def test_save_progress_is_atomic(tmp_path):
+    meta = tmp_path / "f.myidm.json"
+    _save_progress(meta, "http://h/f", 100, "e", [1, 2, 3])
+    assert not (tmp_path / "f.myidm.json.tmp").exists()
+
+
+def test_stale_tmp_does_not_affect_load(tmp_path):
+    meta = tmp_path / "f.myidm.json"
+    _save_progress(meta, "http://h/f", 100, "e", [10, 20, 0])
+    (tmp_path / "f.myidm.json.tmp").write_text("garbage from a crash")
+    assert _load_progress(meta, "http://h/f", 100, "e") == [10, 20, 0]
+
+
+def test_sidecar_never_persists_credentials(tmp_path):
+    meta = tmp_path / "f.myidm.json"
+    _save_progress(meta, "http://user:s3cret@h/f", 100, "e", [0])
+    raw = meta.read_text()
+    assert "s3cret" not in raw
+    assert "user" not in raw
+    # a load with the credentialed URL still matches the stripped stored URL
+    assert _load_progress(meta, "http://user:s3cret@h/f", 100, "e") == [0]
+
+
+# --- make_server fixture behaviour (Task 3) --------------------------------
+
+
+def test_fixture_serves_full_and_ranged(make_server):
+    blob = bytes(range(256)) * 40  # 10240 bytes
+    server = make_server(blob)
+
+    full = requests.get(server.url, timeout=5)
+    assert full.status_code == 200
+    assert full.content == blob
+    assert full.headers["ETag"] == '"test-etag"'
+
+    ranged = requests.get(server.url, headers={"Range": "bytes=100-199"}, timeout=5)
+    assert ranged.status_code == 206
+    assert ranged.headers["Content-Range"] == f"bytes 100-199/{len(blob)}"
+    assert ranged.content == blob[100:200]
+    assert server.served_bytes == len(blob) + 100
+
+
+def test_fixture_no_etag_toggle(make_server):
+    server = make_server(b"x" * 64, no_etag=True)
+    assert "ETag" not in requests.get(server.url, timeout=5).headers
+
+
+def test_fixture_drop_after_toggle(make_server):
+    blob = b"y" * 4000
+    server = make_server(blob, drop_after=1000)
+
+    with pytest.raises(requests.exceptions.RequestException):
+        _ = requests.get(server.url, timeout=5).content  # first response is truncated
+
+    assert requests.get(server.url, timeout=5).content == blob  # then normal
+
+
+# --- _probe (Task 4) ------------------------------------------------------
+
+
+def test_probe_range_server(make_server):
+    blob = os.urandom(4096)
+    server = make_server(blob)
+    r = _probe(server.url)
+    assert r.size == 4096
+    assert r.accept_ranges is True
+    assert r.validator == '"test-etag"'
+    assert r.filename == "file.bin"
+    assert r.resolved_url == server.url
+
+
+def test_probe_no_range_server(make_server):
+    server = make_server(b"z" * 200, support_range=False)
+    r = _probe(server.url)
+    assert r.accept_ranges is False
+    assert r.size == 200
+
+
+def test_probe_no_strong_validator(make_server):
+    server = make_server(b"z" * 200, no_etag=True)
+    assert _probe(server.url).validator == ""
+
+
+def test_probe_rejects_non_http_redirect(monkeypatch):
+    class _FtpResp:
+        url = "ftp://evil/data"
+        status_code = 200
+        headers = {}  # noqa: RUF012 - throwaway stub, never mutated
+
+        def raise_for_status(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("myidm.engine._session.get", lambda *a, **k: _FtpResp())
+    monkeypatch.setattr(netcheck, "assert_allowed_url", _real_assert_allowed_url)
+    with pytest.raises(ValueError, match="non-http"):
+        _probe("http://start/redirect-away")
+
+
+def test_probe_rejects_private_redirect(monkeypatch):
+    class _PrivateResp:
+        url = "http://127.0.0.1:9/evil"
+        status_code = 200
+        headers = {}  # noqa: RUF012 - throwaway stub, never mutated
+
+        def raise_for_status(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("myidm.engine._session.get", lambda *a, **k: _PrivateResp())
+    monkeypatch.setattr(netcheck, "assert_allowed_url", _real_assert_allowed_url)
+    with pytest.raises(BlockedURLError):
+        _probe("http://start/redirect-away")
+
+
+# --- _download_segmented (Task 5) ----------------------------------------
+
+
+def _seg(server, tmp_path, segments, cb=None):
+    p = _probe(server.url)
+    return _download_segmented(
+        p.resolved_url, tmp_path / p.filename, p.size, p.validator, segments, cb
+    )
+
+
+def test_segmented_end_to_end(make_server, tmp_path):
+    blob = os.urandom(5 * 1024 * 1024)
+    server = make_server(blob)
+    out = _seg(server, tmp_path, 4)
+    assert out.read_bytes() == blob
+    assert not _part_path(out).exists()
+    assert not _meta_path(out).exists()
+
+
+def test_segmented_progress_reaches_total(make_server, tmp_path):
+    blob = os.urandom(1024 * 1024)
+    server = make_server(blob)
+    seen = []
+    _seg(server, tmp_path, 4, cb=lambda d, t, s: seen.append((d, t)))
+    assert seen and seen[-1] == (len(blob), len(blob))
+
+
+def test_segmented_retries_past_a_dropped_connection(make_server, tmp_path):
+    blob = os.urandom(512 * 1024)
+    server = make_server(blob, drop_after=1000)
+    assert _seg(server, tmp_path, 4).read_bytes() == blob
+
+
+def test_segmented_clamps_a_server_that_ignores_the_range_end(make_server, tmp_path):
+    # Server honours `start` but sends the whole tail for every segment request.
+    # Each segment must write only into its own slot, or it overruns the next one.
+    blob = os.urandom(512 * 1024)
+    server = make_server(blob, ignore_range_end=True)
+    out = _seg(server, tmp_path, 4)
+    assert out.read_bytes() == blob
+    assert not _part_path(out).exists()
+    assert not _meta_path(out).exists()
+
+
+def test_segmented_integrity_gate_trips_on_short_download(make_server, tmp_path):
+    blob = os.urandom(64 * 1024)
+    server = make_server(blob)
+    p = _probe(server.url)
+    final = tmp_path / p.filename
+    # Claim 100 bytes more than the server has: segments can never fill.
+    with pytest.raises(IntegrityError):
+        _download_segmented(p.resolved_url, final, p.size + 100, p.validator, 1, None)
+    assert _part_path(final).exists()
+    assert _meta_path(final).exists()
+
+
+# --- _download_single + download() wiring (Task 6) ----------------------
+
+
+def test_download_single_end_to_end(make_server, tmp_path):
+    blob = os.urandom(300 * 1024)
+    server = make_server(blob, support_range=False)
+    final = tmp_path / "file.bin"
+    seen = []
+    _download_single(server.url, final, len(blob), lambda d, t, s: seen.append((d, t)))
+    assert final.read_bytes() == blob
+    assert not _part_path(final).exists()
+    assert not _meta_path(final).exists()
+    assert seen and seen[-1] == (len(blob), len(blob))
+
+
+def test_download_single_restarts_from_zero(make_server, tmp_path):
+    blob = os.urandom(256 * 1024)
+    server = make_server(blob, support_range=False)
+    final = tmp_path / "file.bin"
+    _download_single(server.url, final, len(blob), None)
+    _download_single(server.url, final, len(blob), None)  # no half-resume
+    assert final.read_bytes() == blob
+
+
+def test_download_falls_back_when_no_range(make_server, tmp_path):
+    blob = os.urandom(400 * 1024)
+    server = make_server(blob, support_range=False)
+    out = download(server.url, dest_dir=tmp_path, segments=8)
+    assert out.read_bytes() == blob
+    assert not _part_path(out).exists()
+    assert not _meta_path(out).exists()
+
+
+def test_download_segmented_path(make_server, tmp_path):
+    blob = os.urandom(1024 * 1024)
+    server = make_server(blob)
+    out = download(server.url, dest_dir=tmp_path / "sub", segments=999)  # clamped
+    assert out.read_bytes() == blob
+
+
+def test_download_recovers_from_midflight_range_not_supported(make_server, tmp_path, monkeypatch):
+    blob = os.urandom(200 * 1024)
+    server = make_server(blob)
+
+    def boom(resolved_url, final, *a, **k):
+        _part_path(final).write_bytes(b"stale partial")
+        _meta_path(final).write_text("{}")
+        raise RangeNotSupported(resolved_url)
+
+    monkeypatch.setattr(engine, "_download_segmented", boom)
+    out = download(server.url, dest_dir=tmp_path, segments=4)
+    assert out.read_bytes() == blob
+    assert not _part_path(out).exists()
+    assert not _meta_path(out).exists()
+
+
+# --- resume proof (Task 7) ---------------------------------------------
+
+
+def _preseed(server, tmp_path, done_segments, segments=4, validator=None):
+    """Write a `.part` with `done_segments` filled from the real blob and a
+    sidecar that matches. Returns (final, ranges, blob)."""
+    blob = server.data
+    p = _probe(server.url)
+    final = tmp_path / p.filename
+    ranges = split_ranges(p.size, segments)
+    progress = [0] * segments
+    with open(_part_path(final), "wb") as f:
+        f.truncate(p.size)
+        for i in done_segments:
+            s, e = ranges[i]
+            f.seek(s)
+            f.write(blob[s : e + 1])
+            progress[i] = e - s + 1
+    _save_progress(
+        _meta_path(final), p.resolved_url, p.size,
+        p.validator if validator is None else validator, progress,
+    )
+    return final, ranges, blob
+
+
+def test_download_resumes_only_the_remainder(make_server, tmp_path):
+    blob = os.urandom(4 * 1024 * 1024)
+    server = make_server(blob)
+    _, ranges, _ = _preseed(server, tmp_path, done_segments=(0, 1), segments=4)
+
+    server.served_bytes = 0
+    out = download(server.url, dest_dir=tmp_path, segments=4)
+    assert out.read_bytes() == blob
+
+    remaining = sum(ranges[i][1] - ranges[i][0] + 1 for i in (2, 3))
+    # probe costs 1 byte; each in-flight segment may retry once (<= one CHUNK slack).
+    assert remaining <= server.served_bytes <= remaining + 1 + 2 * CHUNK
+
+
+def test_download_restarts_clean_on_stale_validator(make_server, tmp_path):
+    blob = os.urandom(1024 * 1024)
+    server = make_server(blob)
+    # Sidecar says segments 0-1 are done, but under a validator that no longer matches.
+    _preseed(server, tmp_path, done_segments=(0, 1), segments=4, validator='"old-etag"')
+    out = download(server.url, dest_dir=tmp_path, segments=4)
+    assert out.read_bytes() == blob  # stale sidecar ignored, no corruption
+    assert not _meta_path(out).exists()
+
+
+# --- code-review fixes -------------------------------------------------
+
+
+def test_download_restarts_clean_when_part_file_is_missing(make_server, tmp_path):
+    # Sidecar validates against the live probe but the .part bytes are gone.
+    blob = os.urandom(1024 * 1024)
+    server = make_server(blob)
+    final, _, _ = _preseed(server, tmp_path, done_segments=(0, 1), segments=4)
+    _part_path(final).unlink()
+    out = download(server.url, dest_dir=tmp_path, segments=4)
+    assert out.read_bytes() == blob
+    assert not _meta_path(out).exists()
+
+
+def test_download_restarts_clean_when_part_file_is_wrong_size(make_server, tmp_path):
+    blob = os.urandom(1024 * 1024)
+    server = make_server(blob)
+    final, _, _ = _preseed(server, tmp_path, done_segments=(0, 1), segments=4)
+    _part_path(final).write_bytes(b"truncated")  # sidecar still claims 2 segments done
+    out = download(server.url, dest_dir=tmp_path, segments=4)
+    assert out.read_bytes() == blob
+
+
+def test_probe_survives_unknown_content_range_total(monkeypatch):
+    class _Resp:
+        url = "http://h/f.bin"
+        status_code = 206
+        headers = {"Content-Range": "bytes 0-0/*", "Content-Length": "0"}  # noqa: RUF012
+
+        def raise_for_status(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("myidm.engine._session.get", lambda *a, **k: _Resp())
+    assert _probe("http://h/f.bin").size == 0  # no crash on int("*")
+
+
+def test_download_single_rejects_a_truncated_stream(monkeypatch, tmp_path):
+    class _Resp:
+        status_code = 200
+        headers = {}  # noqa: RUF012
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, n):
+            yield b"only a few bytes"
+
+    monkeypatch.setattr("myidm.engine._session.get", lambda *a, **k: _Resp())
+    final = tmp_path / "f.bin"
+    with pytest.raises(IntegrityError):
+        _download_single("http://h/f.bin", final, 1_000_000, None)
+    assert not final.exists()  # never promoted
+
+
+def test_segment_does_not_retry_client_errors(monkeypatch, tmp_path):
+    calls = []
+
+    class _Resp:
+        status_code = 404
+        headers = {}  # noqa: RUF012
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def raise_for_status(self):
+            raise requests.HTTPError(response=self)
+
+        def iter_content(self, n):
+            return iter(())
+
+    def fake_get(*a, **k):
+        calls.append(1)
+        return _Resp()
+
+    monkeypatch.setattr("myidm.engine._session.get", fake_get)
+    part = tmp_path / "f.part"
+    part.write_bytes(b"\x00" * 11)
+    with pytest.raises(requests.HTTPError):
+        engine._download_segment("http://h/f", part, 0, 10, [0], 0)
+    assert len(calls) == 1  # 404 is fatal, not retried
+
+
+# --- cooperative cancellation (Milestone 2 Task 2) -----------------------
+
+
+def test_download_segmented_honours_cancel(make_server, tmp_path):
+    blob = os.urandom(4 * 1024 * 1024)
+    server = make_server(blob)
+    p = _probe(server.url)
+    final = tmp_path / p.filename
+    cancel = threading.Event()
+
+    def on_progress(done, total, speed):
+        if done > 0:
+            cancel.set()
+
+    with pytest.raises(Cancelled):
+        _download_segmented(
+            p.resolved_url, final, p.size, p.validator, 4, on_progress, cancel=cancel
+        )
+    assert _part_path(final).exists()
+    assert _meta_path(final).exists()
+
+
+def test_download_single_honours_cancel(make_server, tmp_path):
+    blob = os.urandom(300 * 1024)
+    server = make_server(blob, support_range=False)
+    final = tmp_path / "file.bin"
+    cancel = threading.Event()
+    cancel.set()  # already set before the first chunk
+    with pytest.raises(Cancelled):
+        _download_single(server.url, final, len(blob), None, cancel=cancel)
+    assert _part_path(final).exists()
+
+
+def test_cancel_none_is_noop(make_server, tmp_path):
+    blob = os.urandom(400 * 1024)
+    server = make_server(blob, support_range=False)
+    out = download(server.url, dest_dir=tmp_path, segments=8, cancel=None)
+    assert out.read_bytes() == blob
+
+
+# --- safety guards: free space, netcheck, output path (Milestone 2 Task 3) --
+
+_NO_SPACE = type("_NoSpace", (), {"free": 10})()
+
+
+def test_insufficient_space_raises_segmented(make_server, tmp_path, monkeypatch):
+    blob = os.urandom(4096)
+    server = make_server(blob)
+    p = _probe(server.url)
+    final = tmp_path / p.filename
+    monkeypatch.setattr(engine.shutil, "disk_usage", lambda path: _NO_SPACE)
+    with pytest.raises(InsufficientSpace):
+        _download_segmented(p.resolved_url, final, p.size, p.validator, 2, None)
+
+
+def test_insufficient_space_raises_single(make_server, tmp_path, monkeypatch):
+    blob = os.urandom(4096)
+    server = make_server(blob, support_range=False)
+    final = tmp_path / "file.bin"
+    monkeypatch.setattr(engine.shutil, "disk_usage", lambda path: _NO_SPACE)
+    with pytest.raises(InsufficientSpace):
+        _download_single(server.url, final, len(blob), None)
+
+
+def test_insufficient_space_accounts_for_existing_part_segmented(
+    make_server, tmp_path, monkeypatch
+):
+    """A resumed .part has already reserved `size` bytes on disk - the check
+    must not demand `size + FREE_SLACK` free on top of that."""
+    blob = os.urandom(4096)
+    server = make_server(blob)
+    p = _probe(server.url)
+    final = tmp_path / p.filename
+    with open(_part_path(final), "wb") as f:
+        f.truncate(p.size)
+    free = type("_Free", (), {"free": engine.FREE_SLACK})()
+    monkeypatch.setattr(engine.shutil, "disk_usage", lambda path: free)
+    out = _download_segmented(p.resolved_url, final, p.size, p.validator, 2, None)
+    assert out.read_bytes() == blob
+
+
+def test_insufficient_space_accounts_for_existing_part_single(
+    make_server, tmp_path, monkeypatch
+):
+    blob = os.urandom(4096)
+    server = make_server(blob, support_range=False)
+    final = tmp_path / "file.bin"
+    with open(_part_path(final), "wb") as f:
+        f.truncate(len(blob))  # e.g. a stale .part from an earlier segmented attempt
+    free = type("_Free", (), {"free": engine.FREE_SLACK})()
+    monkeypatch.setattr(engine.shutil, "disk_usage", lambda path: free)
+    out = _download_single(server.url, final, len(blob), None)
+    assert out.read_bytes() == blob
+
+
+def test_download_segment_rechecks_netcheck(make_server, tmp_path, monkeypatch):
+    blob = os.urandom(4096)
+    server = make_server(blob)
+    p = _probe(server.url)
+    final = tmp_path / p.filename
+
+    def _blocked(url):
+        raise BlockedURLError("blocked")
+
+    monkeypatch.setattr(netcheck, "assert_allowed_url", _blocked)
+    with pytest.raises(BlockedURLError):
+        _download_segmented(p.resolved_url, final, p.size, p.validator, 2, None)
+
+
+def test_download_single_rechecks_netcheck(make_server, tmp_path, monkeypatch):
+    blob = os.urandom(4096)
+    server = make_server(blob, support_range=False)
+    final = tmp_path / "file.bin"
+
+    def _blocked(url):
+        raise BlockedURLError("blocked")
+
+    monkeypatch.setattr(netcheck, "assert_allowed_url", _blocked)
+    with pytest.raises(BlockedURLError):
+        _download_single(server.url, final, len(blob), None)
+
+
+def test_output_path_escape_rejected(make_server, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    blob = os.urandom(1024)
+    server = make_server(blob, support_range=False)  # fixture always names it file.bin
+    try:
+        os.symlink(outside / "evil.bin", dest / "file.bin")
+    except OSError:
+        pytest.skip("symlink creation not permitted on this platform")
+    with pytest.raises(ValueError, match="escapes"):
+        download(server.url, dest_dir=dest)

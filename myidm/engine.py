@@ -1,8 +1,37 @@
-"""Segmented HTTP download engine with resume support."""
+"""Segmented HTTP download engine with resume support.
+
+Resume state is flushed to a JSON sidecar with an atomic temp-file swap but no
+``fsync``: an interrupted *process* resumes cleanly, while a hard power loss may
+cost the last sub-second of progress. That is the intended durability scope.
+"""
 from __future__ import annotations
 
+import json
+import os
+import random
 import re
-from urllib.parse import unquote, urlsplit
+import shutil
+import threading
+import time
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
+from pathlib import Path
+from typing import NamedTuple
+from urllib.parse import unquote, urlsplit, urlunsplit
+
+import requests
+
+from myidm import netcheck
+
+CHUNK = 65536
+SEGMENT_RETRIES = 5
+SAVE_INTERVAL = 1.0
+MAX_SEGMENTS = 32
+FREE_SLACK = 1 << 20  # 1 MiB headroom required beyond the download's own size
+
+# One session shared by the probe and every segment request.
+# ponytail: plain Session, no mounted HTTPAdapter(pool_maxsize=MAX_SEGMENTS) yet.
+# Upgrade path: mount one only if 32 concurrent segments log "connection pool is full".
+_session = requests.Session()
 
 # Windows reserved device names: reserved regardless of extension, case-insensitive.
 _RESERVED_NAMES = {
@@ -14,7 +43,12 @@ _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def split_ranges(size: int, n: int) -> list[tuple[int, int]]:
-    """Split [0, size) into at most n contiguous, inclusive (start, end) ranges."""
+    """Split [0, size) into at most n contiguous, inclusive (start, end) ranges.
+
+    # ponytail: static equal segmentation - the slowest connection sets the
+    # finish time and there is no rebalancing. Upgrade path: work-stealing /
+    # dynamic re-segmentation (hand a stalled segment's tail to an idle worker).
+    """
     if size <= 0:
         raise ValueError("size must be positive")
     n = max(1, min(n, size))
@@ -51,3 +85,376 @@ def derive_filename(url: str, resp) -> str:
     if not name or name.split(".", 1)[0].upper() in _RESERVED_NAMES:
         return "download.bin"
     return name
+
+
+class ProbeResult(NamedTuple):
+    size: int
+    accept_ranges: bool
+    validator: str
+    filename: str
+    resolved_url: str
+
+
+def _probe(url: str) -> ProbeResult:
+    """One ranged ``GET`` (``bytes=0-0``) that doubles as the probe.
+
+    Returns the total size, whether the server honours ``Range``, a strong
+    validator for resume (``ETag`` then ``Last-Modified`` then ``""``), the output
+    filename, and the redirect-resolved URL that every segment request will reuse.
+    A ``Range`` request that a server honours comes back ``206`` with a
+    ``Content-Range`` whose ``/<total>`` is the real size; a server that ignores
+    it answers ``200`` and ``accept_ranges`` is ``False``.
+    """
+    r = _session.get(
+        url,
+        headers={"Range": "bytes=0-0", "Accept-Encoding": "identity"},
+        timeout=30,
+        allow_redirects=True,
+        stream=True,
+    )
+    try:
+        r.raise_for_status()
+        netcheck.assert_allowed_url(r.url)
+        accept_ranges = r.status_code == 206
+        content_range = r.headers.get("Content-Range", "")
+        total = content_range.rsplit("/", 1)[1] if "/" in content_range else ""
+        # `Content-Range: bytes 0-0/*` (unknown total) -> fall back to Content-Length.
+        size = int(total) if total.isdigit() else int(r.headers.get("Content-Length", 0))
+        validator = r.headers.get("ETag") or r.headers.get("Last-Modified") or ""
+        return ProbeResult(size, accept_ranges, validator, derive_filename(r.url, r), r.url)
+    finally:
+        r.close()
+
+
+# --- resume sidecar ---------------------------------------------------------
+#
+# Two files sit next to the output: ``<name>.part`` (the bytes, preallocated to
+# full size) and ``<name>.myidm.json`` (this sidecar). The sidecar is exactly
+# ``{"url": str, "size": int, "etag": str, "progress": [int, ...]}`` where each
+# int is bytes completed for that segment. A load is trusted only when url, size
+# and a *non-empty* etag all match the current probe.
+
+_MAX_SIDECAR_SEGMENTS = 1024  # more entries than this is a tampered file, not us
+
+
+def _part_path(final: Path) -> Path:
+    return final.with_name(final.name + ".part")
+
+
+def _meta_path(final: Path) -> Path:
+    return final.with_name(final.name + ".myidm.json")
+
+
+def _sidecar_url(url: str) -> str:
+    """The URL as stored in the sidecar: any ``user:pass@`` stripped so credentials
+    never reach disk. The credentialed URL is kept in memory for the request only."""
+    parts = urlsplit(url)
+    if parts.username or parts.password:
+        netloc = parts.hostname or ""
+        if parts.port:
+            netloc = f"{netloc}:{parts.port}"
+        parts = parts._replace(netloc=netloc)
+    return urlunsplit(parts)
+
+
+def _load_progress(meta: Path, url: str, size: int, etag: str) -> list[int] | None:
+    """Return the saved per-segment byte counts, but only if the sidecar is
+    trustworthy. Returns None (never raises) for a missing or unparseable file, a
+    url/size mismatch, an absent/empty or mismatched etag, or a progress list that
+    is not all non-negative ints each within its own segment's length."""
+    if not etag:
+        return None
+    try:
+        data = json.loads(meta.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if (
+        data.get("url") != _sidecar_url(url)
+        or data.get("size") != size
+        or data.get("etag") != etag
+    ):
+        return None
+    progress = data.get("progress")
+    if not isinstance(progress, list) or not 1 <= len(progress) <= _MAX_SIDECAR_SEGMENTS:
+        return None
+    ranges = split_ranges(size, len(progress))
+    if len(progress) != len(ranges):
+        return None
+    for done, (start, end) in zip(progress, ranges, strict=True):
+        if type(done) is not int or not 0 <= done <= end - start + 1:
+            return None
+    return progress
+
+
+def _save_progress(meta: Path, url: str, size: int, etag: str, progress: list[int]) -> None:
+    """Atomically write the sidecar: temp file then ``os.replace`` (no fsync - see
+    the module docstring). A crash mid-write cannot strand the whole download."""
+    tmp = meta.with_name(meta.name + ".tmp")
+    tmp.write_text(
+        json.dumps({"url": _sidecar_url(url), "size": size, "etag": etag, "progress": progress})
+    )
+    os.replace(tmp, meta)
+
+
+# --- segmented download ----------------------------------------------------
+
+
+class RangeNotSupported(Exception):
+    """A server answered a ``Range`` request with ``200`` and the whole body."""
+
+
+class IntegrityError(Exception):
+    """The assembled ``.part`` does not account for every byte the probe promised.
+    Raised *before* promotion so the ``.part`` and sidecar survive for a retry."""
+
+
+class Cancelled(Exception):
+    """Raised when a caller-supplied ``cancel`` event is set mid-download.
+    ``.part`` and the sidecar are left in place - the caller decides their fate."""
+
+
+class InsufficientSpace(Exception):
+    """Raised before the first write when the destination volume does not have
+    room for the download plus ``FREE_SLACK`` headroom."""
+
+
+def _check_free_space(part: Path, size: int) -> None:
+    """Require ``size`` bytes of headroom beyond ``FREE_SLACK``, minus whatever
+    ``part`` (e.g. from a resumed or stale prior run) has already reserved on
+    disk - a resume should not be rejected for space it already holds."""
+    if not size:
+        return
+    existing = part.stat().st_size if part.exists() else 0
+    if shutil.disk_usage(part.parent).free < size - existing + FREE_SLACK:
+        raise InsufficientSpace(f"not enough free space for {size} bytes")
+
+
+def _emit(cb, done: int, total: int, speed: list[float]) -> None:
+    """Call ``cb(done, total, bytes_per_sec)``. Speed is the slope between this
+    call and the previous one - two stored floats, not a sample buffer."""
+    if cb is None:
+        return
+    now = time.monotonic()
+    dt = now - speed[0]
+    rate = (done - speed[1]) / dt if dt > 0 else 0.0
+    speed[0], speed[1] = now, done
+    cb(done, total, rate)
+
+
+def _download_segment(
+    resolved_url: str,
+    part: Path,
+    start: int,
+    end: int,
+    progress: list[int],
+    idx: int,
+    cancel: threading.Event | None = None,
+) -> None:
+    """Fetch ``[start + progress[idx] .. end]`` into ``part`` at its true offset.
+
+    Single writer per slot: this thread is the only one that touches
+    ``progress[idx]`` and this disjoint file region (ownership, not atomicity).
+    Retries a dropped connection up to ``SEGMENT_RETRIES`` times, resuming from
+    the current offset; a ``200`` response raises ``RangeNotSupported``. A set
+    ``cancel`` event raises ``Cancelled`` instead of retrying or writing further.
+    """
+    need = end - start + 1
+    for attempt in range(SEGMENT_RETRIES):
+        if cancel is not None and cancel.is_set():
+            raise Cancelled()
+        netcheck.assert_allowed_url(resolved_url)
+        pos = start + progress[idx]
+        if pos > end:
+            return
+        try:
+            with _session.get(
+                resolved_url,
+                headers={"Range": f"bytes={pos}-{end}", "Accept-Encoding": "identity"},
+                stream=True,
+                timeout=30,
+                allow_redirects=False,
+            ) as r:
+                if r.status_code == 200:
+                    raise RangeNotSupported(resolved_url)
+                r.raise_for_status()
+                if r.headers.get("Content-Encoding"):
+                    raise RuntimeError(
+                        f"segment {idx}: unexpected Content-Encoding "
+                        f"{r.headers['Content-Encoding']!r} - byte offsets would desync"
+                    )
+                with open(part, "r+b") as f:
+                    f.seek(pos)
+                    for chunk in r.iter_content(CHUNK):
+                        if cancel is not None and cancel.is_set():
+                            raise Cancelled()
+                        room = need - progress[idx]
+                        if len(chunk) > room:
+                            chunk = chunk[:room]  # server ignored the range end
+                        f.write(chunk)
+                        progress[idx] += len(chunk)
+                        if progress[idx] >= need:
+                            break
+            return
+        except (RangeNotSupported, Cancelled):
+            raise
+        except requests.RequestException as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            fatal = status is not None and 400 <= status < 500 and status not in (408, 429)
+            if fatal or attempt == SEGMENT_RETRIES - 1:
+                raise
+            time.sleep(min(2 ** attempt, 8) + random.random())
+
+
+def _download_segmented(
+    resolved_url: str,
+    final: Path,
+    size: int,
+    validator: str,
+    segments: int,
+    cb,
+    cancel: threading.Event | None = None,
+) -> Path:
+    """Download ``resolved_url`` into ``final`` using ``segments`` parallel ranges,
+    resuming from a trusted sidecar if one is present. Promotes ``.part`` to
+    ``final`` only after every segment is byte-complete. A set ``cancel`` event
+    stops the run and raises ``Cancelled`` before the integrity gate, leaving
+    ``.part`` and the sidecar in place."""
+    part, meta = _part_path(final), _meta_path(final)
+    _check_free_space(part, size)
+    ranges = split_ranges(size, segments)
+    progress = _load_progress(meta, resolved_url, size, validator)
+    # A trusted sidecar is only usable if the .part it describes is still there
+    # at full length - otherwise "segment N done" points at bytes that don't exist.
+    part_ready = part.is_file() and part.stat().st_size == size
+    if progress is None or len(progress) != len(ranges) or not part_ready:
+        progress = [0] * len(ranges)
+        with open(part, "wb") as f:
+            f.truncate(size)
+    _save_progress(meta, resolved_url, size, validator, progress)
+
+    speed = [time.monotonic(), 0.0]
+    ex = ThreadPoolExecutor(max_workers=min(len(ranges), MAX_SEGMENTS))
+    try:
+        pending = {
+            ex.submit(_download_segment, resolved_url, part, s, e, progress, i, cancel)
+            for i, (s, e) in enumerate(ranges)
+            if progress[i] < e - s + 1
+        }
+        while pending and not (cancel is not None and cancel.is_set()):
+            done, pending = wait(pending, timeout=SAVE_INTERVAL, return_when=FIRST_EXCEPTION)
+            _save_progress(meta, resolved_url, size, validator, progress)
+            _emit(cb, sum(progress), size, speed)
+            for fut in done:
+                if fut.exception():
+                    raise fut.exception()
+    finally:
+        ex.shutdown(wait=True, cancel_futures=True)
+
+    if cancel is not None and cancel.is_set():
+        raise Cancelled()
+
+    if sum(progress) != size or any(
+        progress[i] != e - s + 1 for i, (s, e) in enumerate(ranges)
+    ):
+        raise IntegrityError(
+            f"{final.name}: assembled {sum(progress)} of {size} bytes; .part kept for retry"
+        )
+
+    _save_progress(meta, resolved_url, size, validator, progress)
+    _emit(cb, size, size, speed)
+    os.replace(part, final)
+    meta.unlink(missing_ok=True)
+    return final
+
+
+def _download_single(
+    resolved_url: str, final: Path, size: int, cb, cancel: threading.Event | None = None
+) -> Path:
+    """One streamed ``GET`` into ``final``, always from zero - no resume.
+
+    A server that ignored ``Range`` on the probe will ignore it on a re-run too,
+    so there is nothing to resume: ``part`` is rewritten (``"wb"``) every call.
+    Used for no-range or unknown-size sources, and as the fallback when a
+    segmented run hits ``RangeNotSupported`` mid-flight. A set ``cancel`` event
+    raises ``Cancelled``, leaving ``.part`` and the sidecar in place.
+    """
+    part, meta = _part_path(final), _meta_path(final)
+    _check_free_space(part, size)
+    netcheck.assert_allowed_url(resolved_url)
+    speed = [time.monotonic(), 0.0]
+    with _session.get(
+        resolved_url,
+        headers={"Accept-Encoding": "identity"},
+        stream=True,
+        timeout=30,
+        allow_redirects=False,
+    ) as r:
+        r.raise_for_status()
+        if r.status_code >= 300:  # redirect body on the already-resolved URL - not the file
+            raise RuntimeError(f"unexpected {r.status_code} response - no body to save")
+        if r.headers.get("Content-Encoding"):
+            raise RuntimeError(
+                f"unexpected Content-Encoding {r.headers['Content-Encoding']!r} "
+                f"- refusing to save a decoded body"
+            )
+        done = 0
+        last_save = time.monotonic()
+        with open(part, "wb") as f:
+            for chunk in r.iter_content(CHUNK):
+                if cancel is not None and cancel.is_set():
+                    raise Cancelled()
+                f.write(chunk)
+                done += len(chunk)
+                if time.monotonic() - last_save >= SAVE_INTERVAL:
+                    _save_progress(meta, resolved_url, size, "", [done])
+                    _emit(cb, done, size or done, speed)
+                    last_save = time.monotonic()
+    if size and done != size:  # clean EOF short of the promised length
+        raise IntegrityError(f"{final.name}: got {done} of {size} bytes; not promoted")
+    _emit(cb, done, done, speed)
+    os.replace(part, final)
+    meta.unlink(missing_ok=True)
+    return final
+
+
+def download(
+    url: str,
+    dest_dir: str | Path = ".",
+    segments: int = 8,
+    progress_cb=None,
+    cancel: threading.Event | None = None,
+) -> Path:
+    """Download ``url`` into ``dest_dir``, returning the final path.
+
+    Probes once; runs the segmented path when the server honours ``Range`` and
+    the size is known, otherwise a single connection. A mid-flight
+    ``RangeNotSupported`` discards the partial download and retries once via the
+    single-connection path - it is never re-raised to the caller. A set
+    ``cancel`` event raises ``Cancelled``, which propagates to the caller
+    unchanged - it is not an integrity failure.
+    """
+    segments = max(1, min(segments, MAX_SEGMENTS))
+    dest = Path(dest_dir).resolve()
+    dest.mkdir(parents=True, exist_ok=True)
+    probe = _probe(url)
+    final = dest / probe.filename
+    if dest not in final.resolve().parents or dest not in _part_path(final).resolve().parents:
+        raise ValueError("output path escapes dest_dir")
+    if not probe.accept_ranges or probe.size <= 0:
+        return _download_single(probe.resolved_url, final, probe.size, progress_cb, cancel)
+    try:
+        return _download_segmented(
+            probe.resolved_url,
+            final,
+            probe.size,
+            probe.validator,
+            segments,
+            progress_cb,
+            cancel,
+        )
+    except RangeNotSupported:
+        _part_path(final).unlink(missing_ok=True)
+        _meta_path(final).unlink(missing_ok=True)
+        return _download_single(probe.resolved_url, final, probe.size, progress_cb, cancel)

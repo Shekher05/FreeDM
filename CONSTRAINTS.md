@@ -15,7 +15,12 @@ it here first, in its own commit, with a reason.
 ## Dependencies
 
 - **Exactly one runtime dependency: `requests`.** Do not add another runtime
-  dependency without the owner's explicit approval in the task.
+  dependency without the owner's explicit approval in the task. This still
+  holds after Milestone 2 — the local service (`myidm/service.py`,
+  `myidm/netcheck.py`, `myidm/paths.py`) is stdlib-only
+  (`http.server`, `threading`, `concurrent.futures`, `secrets`, `hmac`,
+  `ipaddress`, `socket`, `subprocess`, `signal`); `requests` is used by the
+  engine and by `myidm/client.py` to talk to that service.
 - Dev-only tools allowed: `pytest`, `ruff`. Nothing else without approval.
 - Standard library first. Reach for a new package only when stdlib genuinely
   cannot do the job in a few lines.
@@ -29,15 +34,19 @@ it here first, in its own commit, with a reason.
 - **Concurrency model is fixed for milestone 1:** threads +
   `concurrent.futures`, not `asyncio`. Each download segment owns a disjoint
   byte range and its own file handle; segment writes take no lock. Each
-  `progress[idx]` slot has exactly one writer thread.
+  `progress[idx]` slot has exactly one writer thread. `cancel` (Milestone 2)
+  is a `threading.Event` that is only ever read inside a worker — it adds no
+  new writer.
 - **The resume sidecar is a contract.** `<name>.myidm.json` is exactly:
   `{"url": str, "size": int, "etag": str, "progress": [int, ...]}` where each
   int is bytes completed for that segment. A load is accepted only when
   `url`, `size`, and `etag` all match the current probe.
 - The working file is `<name>.part`, preallocated to full size; it is renamed
   to `<name>` only on full success, and both sidecars are then deleted.
-- No packaging in milestone 1 — the tool runs as `python -m myidm` from the
-  repo root. No `pyproject.toml`, no `setup.py`, no entry-point scripts yet.
+- No packaging — the tool runs as `python -m myidm` from the repo root. No
+  `pyproject.toml`, no `setup.py`, no entry-point scripts. Milestone 2 adds
+  sub-commands (`serve`/`_serve`/`stop`/`add`/`status`/`pause`/`resume`/
+  `cancel`) to the same `python -m myidm` entry point, not packaging.
 
 ## Security standards
 
@@ -47,12 +56,22 @@ it here first, in its own commit, with a reason.
   for an empty result, `.`/`..`, or a Windows reserved device name. A hostile
   `Content-Disposition` or URL therefore cannot write outside the chosen output
   directory. Do not bypass it. (Deeper containment — symlink/realpath checks on
-  the output directory itself — is a Milestone 2 obligation, tracked in the
-  milestone-2 security notes.)
-- (Milestone 2, when it lands) the local service binds to `127.0.0.1` only and
-  requires a shared secret token on every request — any web page in the
-  browser can also reach a localhost port.
+  the output directory itself — is a Milestone 2 obligation, tracked in
+  [`docs/milestone-2-security.md`](docs/milestone-2-security.md).)
+- The local service (`myidm/service.py`) binds `127.0.0.1` only and requires a
+  shared-secret Bearer token on every request, checked with
+  `hmac.compare_digest` (constant-time — any web page in the browser can also
+  reach a localhost port, so a naive `==` comparison would leak the token
+  byte-by-byte via timing). Every URL a caller hands the service (`add`, and
+  the CLI's bare one-shot path) is validated by `netcheck.assert_allowed_url`
+  before a request is made on its behalf — rejects non-`http(s)` schemes and
+  loopback/private/link-local/reserved/multicast IPs (including the
+  `169.254.169.254` cloud-metadata address), resolving hostnames first.
 - Do not add code that follows redirects to non-`http(s)` schemes.
+- Credentials embedded in a download URL (`user:pass@host`) are never
+  persisted: `myidm/redact.py`'s `strip_credentials` scrubs them from
+  `queue.json` and every HTTP snapshot response before they are written or
+  serialized; `redact()` scrubs them from error messages and CLI output.
 
 ## Git conventions
 
