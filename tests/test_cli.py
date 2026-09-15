@@ -53,6 +53,15 @@ def test_add_without_service_exits_cleanly(tmp_path, monkeypatch, capsys):
     assert "Traceback" not in err
 
 
+def test_catch_without_extension_id_exits_cleanly(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("tdm.paths.state_dir", lambda: tmp_path)
+    rc = main(["catch"])
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert "--extension-id" in err
+    assert "Traceback" not in err
+
+
 def test_status_renders(monkeypatch, capsys):
     canned = [
         {"id": "abc", "state": "running", "done": 50, "total": 100, "filename": "f.bin"},

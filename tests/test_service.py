@@ -1,5 +1,6 @@
 import json
 import os
+import queue
 import threading
 import time
 
@@ -91,6 +92,24 @@ def test_download_completes_and_checksum_matches(tmp_path, make_server):
         assert out.read_bytes() == blob
         assert not out.with_name(out.name + ".part").exists()
         assert not out.with_name(out.name + ".tdm.json").exists()
+    finally:
+        mgr.shutdown()
+
+
+def test_manager_populates_seg_progress(tmp_path, make_server):
+    blob = os.urandom(512 * 1024)
+    server = make_server(blob)
+    dl_dir = tmp_path / "dl"
+    mgr = Manager(tmp_path / "queue.json", download_dir=dl_dir)
+    id_ = mgr.add(server.url, segments=4)
+    mgr.start()
+    try:
+        snap = _poll(mgr, id_, {"done", "error"})
+        assert snap["state"] == "done"
+        segs = mgr.segments_of(id_)
+        assert segs is not None
+        assert len(segs) == 4
+        assert all(done == total for done, total in segs)
     finally:
         mgr.shutdown()
 
@@ -455,6 +474,109 @@ def test_full_flow_add_poll_done_over_http(http, make_server):
     assert out.read_bytes() == blob
 
 
+# --- /ext/* routes (Milestone 3 Task 1) ------------------------------------
+
+EXT_ORIGIN = "chrome-extension://abcdefghijklmnopqrstuvwxyzabcdef"
+EXT_TOKEN = "ext-token-" + "y" * 20
+
+
+@pytest.fixture
+def ext_http(tmp_path):
+    mgr = Manager(tmp_path / "queue.json", download_dir=tmp_path / "dl")
+    pending = queue.Queue(maxsize=100)
+    server, port = serve_in_thread(
+        mgr, TOKEN, allowed_origin=EXT_ORIGIN, ext_token=EXT_TOKEN, pending=pending
+    )
+    mgr.start()
+    base = f"http://127.0.0.1:{port}"
+    try:
+        yield mgr, base, pending
+    finally:
+        mgr.shutdown()
+        server.shutdown()
+        server.server_close()
+
+
+def test_ext_routes_401_without_allowed_origin(http):
+    """`http` fixture has `allowed_origin=None` - the default, unmodified
+    behavior for the normal detached service. `/ext/*` must 401 there
+    regardless of Origin, since the service was never put in catch mode."""
+    _mgr, base = http
+    r = requests.post(base + "/ext/health", headers={"Origin": EXT_ORIGIN}, timeout=5)
+    assert r.status_code == 401
+    r = requests.post(
+        base + "/ext/flag",
+        json={"url": "http://h/f"},
+        headers={"Origin": EXT_ORIGIN, "X-Ext-Token": EXT_TOKEN},
+        timeout=5,
+    )
+    assert r.status_code == 401
+
+
+def test_ext_flag_queues_with_matching_origin_and_token(ext_http):
+    _mgr, base, pending = ext_http
+    r = requests.post(
+        base + "/ext/flag",
+        json={"url": "http://h/f"},
+        headers={"Origin": EXT_ORIGIN, "X-Ext-Token": EXT_TOKEN},
+        timeout=5,
+    )
+    assert r.status_code == 202
+    assert pending.get_nowait() == "http://h/f"
+
+
+def test_ext_flag_rejects_mismatched_origin(ext_http):
+    _mgr, base, pending = ext_http
+    r = requests.post(
+        base + "/ext/flag",
+        json={"url": "http://h/f"},
+        headers={"Origin": "chrome-extension://wrong", "X-Ext-Token": EXT_TOKEN},
+        timeout=5,
+    )
+    assert r.status_code == 401
+    assert pending.empty()
+
+
+def test_ext_flag_rejects_missing_or_mismatched_token(ext_http):
+    _mgr, base, pending = ext_http
+    r = requests.post(
+        base + "/ext/flag",
+        json={"url": "http://h/f"},
+        headers={"Origin": EXT_ORIGIN},
+        timeout=5,
+    )
+    assert r.status_code == 401
+    r = requests.post(
+        base + "/ext/flag",
+        json={"url": "http://h/f"},
+        headers={"Origin": EXT_ORIGIN, "X-Ext-Token": "wrong-token"},
+        timeout=5,
+    )
+    assert r.status_code == 401
+    assert pending.empty()
+
+
+def test_ext_flag_rejects_private_url(ext_http, monkeypatch):
+    monkeypatch.setattr(netcheck, "assert_allowed_url", _real_assert_allowed_url)
+    _mgr, base, pending = ext_http
+    r = requests.post(
+        base + "/ext/flag",
+        json={"url": "http://127.0.0.1:9/x"},
+        headers={"Origin": EXT_ORIGIN, "X-Ext-Token": EXT_TOKEN},
+        timeout=5,
+    )
+    assert r.status_code == 400
+    assert r.json()["error"] == "blocked"
+    assert pending.empty()
+
+
+def test_ext_health_returns_configured_token(ext_http):
+    _mgr, base, _pending = ext_http
+    r = requests.post(base + "/ext/health", headers={"Origin": EXT_ORIGIN}, timeout=5)
+    assert r.status_code == 200
+    assert r.json()["token"] == EXT_TOKEN
+
+
 def test_shutdown_stops_server(http):
     _mgr, base = http
     r = requests.post(base + "/shutdown", headers=_auth(), timeout=5)
@@ -530,3 +652,195 @@ def test_stale_state_is_cleared(tmp_path, monkeypatch):
     monkeypatch.setattr(service.requests, "get", fake_get)
     monkeypatch.setattr(service.subprocess, "Popen", fake_popen)
     assert service.spawn_detached() == "http://127.0.0.1:54321"
+
+
+# --- catch-mode helpers (Milestone 3 Task 2) --------------------------------
+
+
+def test_resolve_origin_persists_and_reuses(tmp_path, monkeypatch):
+    monkeypatch.setattr(paths, "state_dir", lambda: tmp_path)
+    origin = service.resolve_origin("abc123")
+    assert origin == "chrome-extension://abc123"
+    assert service.resolve_origin(None) == "chrome-extension://abc123"
+
+
+def test_resolve_origin_without_id_or_stored_raises(tmp_path, monkeypatch):
+    monkeypatch.setattr(paths, "state_dir", lambda: tmp_path)
+    with pytest.raises(SystemExit, match="extension id"):
+        service.resolve_origin(None)
+
+
+def test_resolve_ext_token_persists_across_calls(tmp_path, monkeypatch):
+    monkeypatch.setattr(paths, "state_dir", lambda: tmp_path)
+    first = service.resolve_ext_token()
+    second = service.resolve_ext_token()
+    assert first == second
+    assert (tmp_path / "ext_token").read_text() == first
+
+
+def test_confirm_loop_accepts_y_skips_n(tmp_path, monkeypatch):
+    mgr = Manager(tmp_path / "queue.json", download_dir=tmp_path / "dl")
+    pending = queue.Queue()
+    pending.put("http://h/keep")
+    pending.put("http://h/skip")
+    pending.put(None)
+
+    answers = iter(["y", "n"])
+    monkeypatch.setattr("builtins.input", lambda *a: next(answers))
+    service._confirm_loop(mgr, pending)
+
+    assert len(mgr.snapshot()) == 1
+    assert mgr.snapshot()[0]["url"] == "http://h/keep"
+
+
+def test_confirm_loop_survives_bad_url(tmp_path, monkeypatch):
+    monkeypatch.setattr(netcheck, "assert_allowed_url", _real_assert_allowed_url)
+    mgr = Manager(tmp_path / "queue.json", download_dir=tmp_path / "dl")
+    pending = queue.Queue()
+    pending.put("http://127.0.0.1:9/blocked")
+    pending.put(None)
+
+    monkeypatch.setattr("builtins.input", lambda *a: "y")
+    service._confirm_loop(mgr, pending)  # must not raise
+
+    assert mgr.snapshot() == []
+
+
+# --- run_catch() (Milestone 3 Task 3) ---------------------------------------
+
+
+def test_run_catch_ext_flag_flow_and_shutdown(tmp_path, make_server, monkeypatch):
+    monkeypatch.setattr(paths, "state_dir", lambda: tmp_path)
+    monkeypatch.setattr(paths, "default_download_dir", lambda: tmp_path / "dl")
+    origin = service.resolve_origin("test-ext-id")
+    monkeypatch.setattr("builtins.input", lambda *a: "y")
+
+    t = threading.Thread(target=service.run_catch, args=(origin,), daemon=True)
+    t.start()
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not (tmp_path / "service.port").exists():
+            time.sleep(0.02)
+        assert (tmp_path / "service.port").exists()
+
+        base = f"http://127.0.0.1:{service.CATCH_PORT}"
+        r = requests.post(base + "/ext/health", headers={"Origin": origin}, timeout=5)
+        assert r.status_code == 200
+        ext_token = r.json()["token"]
+
+        server = make_server(os.urandom(1024))
+        r = requests.post(
+            base + "/ext/flag",
+            json={"url": server.url},
+            headers={"Origin": origin, "X-Ext-Token": ext_token},
+            timeout=5,
+        )
+        assert r.status_code == 202
+
+        deadline = time.monotonic() + 15
+        done = False
+        while time.monotonic() < deadline:
+            text = paths.read_or_none(tmp_path / "queue.json")
+            if text:
+                data = json.loads(text)
+                if any(e["state"] == "done" for e in data["downloads"]):
+                    done = True
+                    break
+            time.sleep(0.05)
+        assert done
+
+        service_token = paths.read_or_none(tmp_path / "service.token")
+        r = requests.post(
+            base + "/shutdown",
+            headers={"Authorization": f"Bearer {service_token}"},
+            timeout=5,
+        )
+        assert r.status_code == 202
+    finally:
+        # best-effort - a fixed-port server left running by an earlier
+        # assertion failure must never survive the test: it would squat
+        # CATCH_PORT and take out every later run of this test.
+        service_token = paths.read_or_none(tmp_path / "service.token")
+        if service_token:
+            try:
+                requests.post(
+                    f"http://127.0.0.1:{service.CATCH_PORT}/shutdown",
+                    headers={"Authorization": f"Bearer {service_token}"},
+                    timeout=5,
+                )
+            except requests.RequestException:
+                pass
+        t.join(timeout=10)
+
+    for name in ("service.port", "service.token", "service.pid"):
+        assert not (tmp_path / name).exists()
+    assert (tmp_path / "extension_id").exists()
+    assert (tmp_path / "ext_token").exists()
+
+
+# --- live progress display (Milestone 3 Task 4) -----------------------------
+
+
+def test_format_frame_renders_active_segments_and_aggregate():
+    rows = [
+        {
+            "phase": "active",
+            "name": "file.bin",
+            "done": 40,
+            "total": 100,
+            "segments": [(50, 50), (10, 50)],
+        }
+    ]
+    lines = service._format_frame(rows)
+    assert len(lines) == 3
+    assert "100%" in lines[0]
+    assert " 20%" in lines[1]
+    assert lines[2].startswith("file.bin ")
+    assert " 40%" in lines[2]
+
+
+def test_format_frame_terminal_phases():
+    assert service._format_frame([{"phase": "done", "name": "a.bin"}]) == ["done -> a.bin"]
+    assert service._format_frame(
+        [{"phase": "error", "name": "a.bin", "error": "boom"}]
+    ) == ["error: boom -> a.bin"]
+    assert service._format_frame([{"phase": "cancelled", "name": "a.bin"}]) == [
+        "cancelled -> a.bin"
+    ]
+    assert service._format_frame(
+        [{"phase": "combining", "name": "a.bin", "segments": [(1, 1), (1, 1)]}]
+    ) == ["combining 2 segments -> a.bin"]
+
+
+class _FakeManager:
+    def __init__(self, snapshots, segments=None):
+        self._snapshots = snapshots
+        self._segments = segments or {}
+
+    def snapshot_one(self, id_):
+        return self._snapshots.get(id_)
+
+    def segments_of(self, id_):
+        return self._segments.get(id_)
+
+
+def test_frame_rows_holds_combining_one_extra_tick_then_drops():
+    mgr = _FakeManager(
+        {"a": {"state": "done", "filename": "a.bin"}}, segments={"a": [(10, 10)]}
+    )
+    watched = {"a": 0}
+
+    rows1 = service._frame_rows(mgr, watched)
+    assert rows1 == [{"phase": "combining", "name": "a.bin", "segments": [(10, 10)]}]
+    assert watched == {"a": 1}
+
+    rows2 = service._frame_rows(mgr, watched)
+    assert rows2 == [{"phase": "done", "name": "a.bin", "error": None}]
+    assert watched == {}
+
+
+def test_frame_rows_drops_id_once_manager_forgets_it():
+    mgr = _FakeManager({})
+    watched = {"gone": 0}
+    assert service._frame_rows(mgr, watched) == []
+    assert watched == {}

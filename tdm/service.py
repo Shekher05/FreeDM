@@ -8,8 +8,10 @@ Upgrade path: per-download locks if the scheduler itself becomes a bottleneck.
 import hmac
 import json
 import os
+import queue
 import secrets
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -30,6 +32,9 @@ _TERMINAL_STATES = {"done", "error", "cancelled"}
 _KEEP_TERMINAL = 50
 _NO_RETRY_EXCEPTIONS = (engine.InsufficientSpace, ValueError)  # ValueError covers BlockedURLError
 _MAX_BODY = 64 * 1024
+_EXT_ROUTES = {"/ext/health", "/ext/flag"}
+CATCH_PORT = 8765
+_PENDING_MAX = 100
 
 
 @dataclass
@@ -47,6 +52,7 @@ class Download:
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     mode: str | None = field(default=None, repr=False)
     demoted: bool = field(default=False, repr=False)
+    seg_progress: list[tuple[int, int]] | None = field(default=None, repr=False)
 
 
 class Manager:
@@ -208,7 +214,12 @@ class Manager:
         segs = min(self._host_caps.get(host, dl.segments), engine.MAX_SEGMENTS)
         try:
             final = engine.download(
-                dl.url, dl.dest_dir, segs, progress_cb=self._cb(dl), cancel=dl.cancel_event
+                dl.url,
+                dl.dest_dir,
+                segs,
+                progress_cb=self._cb(dl),
+                cancel=dl.cancel_event,
+                segment_cb=self._seg_cb(dl),
             )
         except engine.Cancelled:
             self._on_cancelled(dl)
@@ -272,6 +283,17 @@ class Manager:
 
         return _progress
 
+    def _seg_cb(self, dl: Download):
+        def _seg_progress(segments: list[tuple[int, int]]) -> None:
+            dl.seg_progress = segments
+
+        return _seg_progress
+
+    def segments_of(self, id_: str) -> list[tuple[int, int]] | None:
+        with self._cond:
+            dl = self._downloads.get(id_)
+            return dl.seg_progress if dl else None
+
     def _keep(self) -> list[Download]:
         active = [dl for dl in self._downloads.values() if dl.state not in _TERMINAL_STATES]
         terminal = [dl for dl in self._downloads.values() if dl.state in _TERMINAL_STATES]
@@ -299,6 +321,28 @@ class _Handler(BaseHTTPRequestHandler):
         if not presented.startswith(prefix):
             return False
         return hmac.compare_digest(self.server.token, presented[len(prefix) :])
+
+    def _allowed(self, method: str) -> bool:
+        """Bearer token always works. Otherwise, only a POST to an `/ext/*`
+        route with a matching `Origin` (and, for `/ext/flag`, a matching
+        `X-Ext-Token`) is let through - this is what lets the browser
+        extension reach those two routes without ever seeing the Bearer
+        token."""
+        if self._authed():
+            return True
+        if method != "POST" or self.path not in _EXT_ROUTES:
+            return False
+        if self.server.allowed_origin is None:
+            return False
+        if self.headers.get("Origin") != self.server.allowed_origin:
+            return False
+        if self.path == "/ext/flag":
+            presented = self.headers.get("X-Ext-Token", "")
+            if not self.server.ext_token or not hmac.compare_digest(
+                self.server.ext_token, presented
+            ):
+                return False
+        return True
 
     def _send_json(self, status: int, payload) -> None:
         body = json.dumps(payload).encode("utf-8")
@@ -338,12 +382,18 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
     def do_POST(self) -> None:
-        if not self._authed():
+        if not self._allowed("POST"):
             self._send_json(401, {"error": "unauthorized"})
             return
         manager: Manager = self.server.manager
         path = self.path
-        if path == "/downloads":
+        if path == "/ext/health":
+            self._send_json(
+                200, {"ok": True, "version": __version__, "token": self.server.ext_token}
+            )
+        elif path == "/ext/flag":
+            self._handle_flag()
+        elif path == "/downloads":
             self._handle_add(manager)
         elif path == "/shutdown":
             self._send_json(202, {"ok": True})
@@ -352,6 +402,31 @@ class _Handler(BaseHTTPRequestHandler):
             self._handle_action(manager, path[len("/downloads/") :])
         else:
             self._send_json(404, {"error": "not found"})
+
+    def _handle_flag(self) -> None:
+        try:
+            body = self._read_json_body()
+        except ValueError:
+            self._send_json(400, {"error": "bad request"})
+            return
+        url = body.get("url")
+        if not isinstance(url, str) or not url:
+            self._send_json(400, {"error": "missing url"})
+            return
+        try:
+            netcheck.assert_allowed_url(url)
+        except netcheck.BlockedURLError:
+            self._send_json(400, {"error": "blocked"})
+            return
+        if self.server.pending is None:
+            self._send_json(404, {"error": "not found"})
+            return
+        try:
+            self.server.pending.put_nowait(url)
+        except queue.Full:
+            self._send_json(503, {"error": "busy"})
+            return
+        self._send_json(202, {"ok": True})
 
     def _handle_add(self, manager: "Manager") -> None:
         try:
@@ -391,24 +466,58 @@ class _Handler(BaseHTTPRequestHandler):
     def _shutdown(server: "_Server") -> None:
         server.manager.shutdown()
         server.shutdown()
+        if server.pending is not None:
+            server.pending.put(None)  # unblock run_catch()'s _confirm_loop
 
 
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, manager: Manager, token: str, host: str = "127.0.0.1", port: int = 0):
-        super().__init__((host, port), _Handler)
+    def __init__(
+        self,
+        manager: Manager,
+        token: str,
+        host: str = "127.0.0.1",
+        port: int = 0,
+        allowed_origin: str | None = None,
+        ext_token: str | None = None,
+        pending: "queue.Queue | None" = None,
+    ):
+        # set before super().__init__() - it calls server_bind(), which reads
+        # self.pending to decide whether to harden the socket for catch mode.
         self.manager = manager
         self.token = token
+        self.allowed_origin = allowed_origin
+        self.ext_token = ext_token
+        self.pending = pending
+        super().__init__((host, port), _Handler)
+
+    def server_bind(self) -> None:
+        # Windows hardening for catch mode's fixed, predictable CATCH_PORT:
+        # stops another process from silently binding it out from under a
+        # running `tdm catch` (see milestone-3-plan.md Risks). SO_EXCLUSIVEADDRUSE
+        # and SO_REUSEADDR conflict on Windows, so this also turns the latter
+        # off for this instance - fine here since catch mode never needs the
+        # TIME_WAIT-reuse behavior `run_service()`'s ephemeral port relies on.
+        if sys.platform == "win32" and self.pending is not None:
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            self.allow_reuse_address = False
+        super().server_bind()
 
 
 def serve_in_thread(
-    manager: Manager, token: str, host: str = "127.0.0.1", port: int = 0
+    manager: Manager,
+    token: str,
+    host: str = "127.0.0.1",
+    port: int = 0,
+    allowed_origin: str | None = None,
+    ext_token: str | None = None,
+    pending: "queue.Queue | None" = None,
 ) -> tuple[_Server, int]:
     """Start `_Server` on its own daemon thread; returns the server (so the
     caller can `.shutdown()` it) and the bound port."""
-    server = _Server(manager, token, host, port)
+    server = _Server(manager, token, host, port, allowed_origin, ext_token, pending)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server, server.server_address[1]
 
@@ -468,20 +577,196 @@ def run_service() -> None:
     _clear_state_files(d)
 
 
+def _healthy(endpoint: tuple[str, str] | None) -> bool:
+    """`GET /health` with a short timeout; `True` only on a clean 200."""
+    if endpoint is None:
+        return False
+    base_url, token = endpoint
+    try:
+        r = requests.get(
+            f"{base_url}/health", headers={"Authorization": f"Bearer {token}"}, timeout=2
+        )
+        return r.status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def resolve_origin(extension_id: str | None) -> str:
+    """The extension's `Origin` header value (`chrome-extension://<id>`),
+    persisting a newly-given id to `state_dir()/extension_id` so a later bare
+    `tdm catch` reuses it. Raises `SystemExit` when neither a fresh id nor a
+    stored one is available."""
+    path = paths.state_dir() / "extension_id"
+    if extension_id:
+        paths.write_atomic(path, extension_id)
+    else:
+        extension_id = paths.read_or_none(path)
+    if not extension_id:
+        raise SystemExit("no extension id - run: tdm catch --extension-id <id>")
+    return f"chrome-extension://{extension_id}"
+
+
+def resolve_ext_token() -> str:
+    """A random per-install secret for `/ext/flag`, persisted to
+    `state_dir()/ext_token` so it survives across `tdm catch` runs - the
+    extension picks it up automatically from `/ext/health`, no user action
+    needed."""
+    path = paths.state_dir() / "ext_token"
+    token = paths.read_or_none(path)
+    if token:
+        return token
+    token = secrets.token_hex(16)
+    paths.write_atomic(path, token)
+    return token
+
+
+def _bar(frac: float, width: int = 20) -> str:
+    return "#" * int(max(0.0, min(1.0, frac)) * width)
+
+
+def _frame_rows(manager: Manager, watched: dict[str, int]) -> list[dict]:
+    """Build the data for one redraw tick from `watched` (id -> phase: 0 while
+    active, 1 once a terminal state's "combining" line has been shown). Mutates
+    `watched` - advances or drops an id - but does no I/O; `_format_frame` turns
+    the result into printable lines."""
+    rows = []
+    for id_ in list(watched):
+        snap = manager.snapshot_one(id_)
+        if snap is None:
+            del watched[id_]
+            continue
+        name = snap.get("filename") or "..."
+        state = snap["state"]
+        if state in _TERMINAL_STATES:
+            if watched[id_] == 0:
+                segs = manager.segments_of(id_) or []
+                rows.append({"phase": "combining", "name": name, "segments": segs})
+                watched[id_] = 1
+            else:
+                rows.append({"phase": state, "name": name, "error": snap.get("error")})
+                del watched[id_]
+        else:
+            rows.append(
+                {
+                    "phase": "active",
+                    "name": name,
+                    "done": snap["done"],
+                    "total": snap["total"],
+                    "segments": manager.segments_of(id_),
+                }
+            )
+    return rows
+
+
+def _format_frame(rows: list[dict]) -> list[str]:
+    """Pure: turn `_frame_rows()` output into printable lines - no I/O, so this
+    is the part unit tests exercise directly."""
+    lines: list[str] = []
+    for row in rows:
+        phase = row["phase"]
+        if phase == "combining":
+            lines.append(f"combining {len(row['segments'])} segments -> {row['name']}")
+        elif phase == "done":
+            lines.append(f"done -> {row['name']}")
+        elif phase == "error":
+            lines.append(f"error: {row.get('error') or ''} -> {row['name']}")
+        elif phase == "cancelled":
+            lines.append(f"cancelled -> {row['name']}")
+        else:
+            for i, (d, t) in enumerate(row.get("segments") or []):
+                frac = d / t if t else 1.0
+                lines.append(f"  seg {i}: [{_bar(frac):<20}] {frac * 100:3.0f}%")
+            frac = row["done"] / row["total"] if row["total"] else 0.0
+            lines.append(f"{row['name']} [{_bar(frac):<20}] {frac * 100:3.0f}%")
+    return lines
+
+
+def _render_active(manager: Manager, watched: dict[str, int], last_count: int) -> int:
+    """I/O wrapper: erase the previous frame (ANSI cursor-up + clear-to-end,
+    stdlib escape codes - no dependency) and print the new one. Returns the new
+    line count so the next call knows how far to erase."""
+    lines = _format_frame(_frame_rows(manager, watched))
+    if last_count:
+        sys.stdout.write(f"\x1b[{last_count}A\x1b[J")
+    if lines:
+        sys.stdout.write("\n".join(lines) + "\n")
+    sys.stdout.flush()
+    return len(lines)
+
+
+def _confirm_loop(manager: Manager, pending: "queue.Queue") -> None:
+    """Runs on the main thread: ask `y/n` for each flagged URL, in arrival
+    order, and redraw the live per-segment/aggregate progress of every
+    confirmed-but-unfinished download on each tick. A `None` sentinel exits the
+    loop (used at shutdown). `get(timeout=...)` rather than a bare blocking
+    `get` so Ctrl-C can interrupt it on Windows."""
+    watched: dict[str, int] = {}
+    last_count = 0
+    while True:
+        try:
+            url = pending.get(timeout=0.5)
+        except queue.Empty:
+            last_count = _render_active(manager, watched, last_count)
+            continue
+        if url is None:
+            return
+        print(redact(url))
+        if input("  [y/n]? ").strip().lower() == "y":
+            try:
+                watched[manager.add(url)] = 0
+            except Exception as exc:  # noqa: BLE001 - one bad link must not kill the loop
+                print(redact(str(exc)))
+        last_count = _render_active(manager, watched, last_count)
+
+
+def run_catch(origin: str) -> None:
+    """Blocking: run in the foreground with browser-flagged downloads confirmed
+    `y/n` on the main thread before they queue. This is what `python -m tdm
+    catch` runs directly (never detaches, unlike `run_service()`)."""
+    if _healthy(read_endpoint()):
+        raise SystemExit("tdm service already running - run: tdm stop")
+    d = paths.state_dir()
+    _clear_state_files(d)
+    token = secrets.token_urlsafe(32)
+    ext_token = resolve_ext_token()
+    pending: queue.Queue = queue.Queue(maxsize=_PENDING_MAX)
+    manager = Manager(d / "queue.json", download_dir=paths.default_download_dir())
+    server = _Server(
+        manager,
+        token,
+        port=CATCH_PORT,
+        allowed_origin=origin,
+        ext_token=ext_token,
+        pending=pending,
+    )
+    paths.write_atomic(d / "service.port", str(server.server_address[1]))
+    paths.write_atomic(d / "service.token", token)
+    paths.write_atomic(d / "service.pid", str(os.getpid()))
+    manager.start()
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    if sys.platform == "win32":
+        os.system("")  # enable ANSI/VT processing so _render_active's escapes work in cmd.exe
+    try:
+        _confirm_loop(manager, pending)
+    except (KeyboardInterrupt, EOFError):
+        pass
+    finally:
+        while not pending.empty():
+            leftover = pending.get_nowait()
+            if leftover is not None:
+                print(f"unanswered: {redact(leftover)}")
+        manager.shutdown()
+        server.shutdown()
+        server.server_close()
+        _clear_state_files(d)
+
+
 def spawn_detached() -> str:
     """Start `run_service()` in a detached child process if one isn't already
     healthy; returns a one-line status message."""
     endpoint = read_endpoint()
-    if endpoint is not None:
-        base_url, token = endpoint
-        try:
-            r = requests.get(
-                f"{base_url}/health", headers={"Authorization": f"Bearer {token}"}, timeout=2
-            )
-            if r.status_code == 200:
-                return f"already running on {base_url}"
-        except requests.RequestException:
-            pass
+    if _healthy(endpoint):
+        return f"already running on {endpoint[0]}"
 
     d = paths.state_dir()
     _clear_state_files(d)

@@ -26,7 +26,7 @@ def _human(n: float) -> str:
 
 def _progress(done: int, total: int, bps: float) -> None:
     if total:
-        frac = done / total
+        frac = max(0.0, min(1.0, done / total))
         eta = (total - done) / bps if bps > 0 else 0.0
         bar = "#" * int(frac * 30)
         line = f"\r[{bar:<30}] {frac * 100:5.1f}%  {_human(bps)}/s  ETA {eta:4.0f}s"
@@ -36,7 +36,9 @@ def _progress(done: int, total: int, bps: float) -> None:
     sys.stderr.flush()
 
 
-_SERVICE_SUBCOMMANDS = {"serve", "_serve", "stop", "add", "status", "cancel", "pause", "resume"}
+_SERVICE_SUBCOMMANDS = {
+    "serve", "_serve", "stop", "add", "status", "cancel", "pause", "resume", "catch",
+}
 
 
 def _cmd_add(rest: list[str]) -> int:
@@ -96,6 +98,17 @@ def _cmd_action(cmd: str, rest: list[str]) -> int:
     return 1
 
 
+def _cmd_catch(rest: list[str]) -> int:
+    from tdm import service
+
+    p = argparse.ArgumentParser(prog="tdm catch")
+    p.add_argument("--extension-id", default=None)
+    args = p.parse_args(rest)
+
+    service.run_catch(service.resolve_origin(args.extension_id))
+    return 0
+
+
 def _run_service_subcommand(cmd: str, rest: list[str]) -> int:
     from tdm import service
 
@@ -110,6 +123,8 @@ def _run_service_subcommand(cmd: str, rest: list[str]) -> int:
             return _cmd_add(rest)
         elif cmd == "status":
             return _cmd_status(rest)
+        elif cmd == "catch":
+            return _cmd_catch(rest)
         else:  # cancel / pause / resume
             return _cmd_action(cmd, rest)
     except SystemExit as e:

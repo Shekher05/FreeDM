@@ -358,6 +358,29 @@ def test_download_segmented_path(make_server, tmp_path):
     assert out.read_bytes() == blob
 
 
+def test_download_segmented_reports_per_segment_progress(make_server, tmp_path):
+    blob = os.urandom(512 * 1024)
+    server = make_server(blob)
+    frames = []
+    out = download(server.url, dest_dir=tmp_path, segments=4, segment_cb=frames.append)
+    assert out.read_bytes() == blob
+    assert frames  # at least the final call
+    for frame in frames:
+        assert len(frame) == 4
+    last = frames[-1]
+    assert all(done == total for done, total in last)
+
+
+def test_download_single_reports_one_segment(make_server, tmp_path):
+    blob = os.urandom(64 * 1024)
+    server = make_server(blob, support_range=False)
+    frames = []
+    out = download(server.url, dest_dir=tmp_path, segment_cb=frames.append)
+    assert out.read_bytes() == blob
+    assert frames
+    assert frames[-1] == [(len(blob), len(blob))]
+
+
 def test_download_recovers_from_midflight_range_not_supported(make_server, tmp_path, monkeypatch):
     blob = os.urandom(200 * 1024)
     server = make_server(blob)

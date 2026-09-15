@@ -243,6 +243,28 @@ def _emit(cb, done: int, total: int, speed: list[float]) -> None:
     cb(done, total, rate)
 
 
+def _write_segment_chunks(
+    r,
+    f,
+    need: int,
+    progress: list[int],
+    idx: int,
+    cancel: threading.Event | None,
+) -> None:
+    """Write ``r``'s body into ``f`` at its current position, advancing
+    ``progress[idx]`` per chunk and stopping once ``need`` bytes are written."""
+    for chunk in r.iter_content(CHUNK):
+        if cancel is not None and cancel.is_set():
+            raise Cancelled()
+        room = need - progress[idx]
+        if len(chunk) > room:
+            chunk = chunk[:room]  # server ignored the range end
+        f.write(chunk)
+        progress[idx] += len(chunk)
+        if progress[idx] >= need:
+            break
+
+
 def _download_segment(
     resolved_url: str,
     part: Path,
@@ -286,16 +308,7 @@ def _download_segment(
                     )
                 with open(part, "r+b") as f:
                     f.seek(pos)
-                    for chunk in r.iter_content(CHUNK):
-                        if cancel is not None and cancel.is_set():
-                            raise Cancelled()
-                        room = need - progress[idx]
-                        if len(chunk) > room:
-                            chunk = chunk[:room]  # server ignored the range end
-                        f.write(chunk)
-                        progress[idx] += len(chunk)
-                        if progress[idx] >= need:
-                            break
+                    _write_segment_chunks(r, f, need, progress, idx, cancel)
             return
         except (RangeNotSupported, Cancelled):
             raise
@@ -315,15 +328,19 @@ def _download_segmented(
     segments: int,
     cb,
     cancel: threading.Event | None = None,
+    segment_cb=None,
 ) -> Path:
     """Download ``resolved_url`` into ``final`` using ``segments`` parallel ranges,
     resuming from a trusted sidecar if one is present. Promotes ``.part`` to
     ``final`` only after every segment is byte-complete. A set ``cancel`` event
     stops the run and raises ``Cancelled`` before the integrity gate, leaving
-    ``.part`` and the sidecar in place."""
+    ``.part`` and the sidecar in place. ``segment_cb``, if given, is called with
+    a ``[(done, total), ...]`` list (one entry per segment) on the same cadence
+    as ``cb``, plus once more on completion."""
     part, meta = _part_path(final), _meta_path(final)
     _check_free_space(part, size)
     ranges = split_ranges(size, segments)
+    totals = [e - s + 1 for s, e in ranges]
     progress = _load_progress(meta, resolved_url, size, validator)
     # A trusted sidecar is only usable if the .part it describes is still there
     # at full length - otherwise "segment N done" points at bytes that don't exist.
@@ -346,6 +363,8 @@ def _download_segmented(
             done, pending = wait(pending, timeout=SAVE_INTERVAL, return_when=FIRST_EXCEPTION)
             _save_progress(meta, resolved_url, size, validator, progress)
             _emit(cb, sum(progress), size, speed)
+            if segment_cb is not None:
+                segment_cb(list(zip(progress, totals, strict=True)))
             for fut in done:
                 if fut.exception():
                     raise fut.exception()
@@ -364,13 +383,20 @@ def _download_segmented(
 
     _save_progress(meta, resolved_url, size, validator, progress)
     _emit(cb, size, size, speed)
+    if segment_cb is not None:
+        segment_cb(list(zip(progress, totals, strict=True)))
     os.replace(part, final)
     meta.unlink(missing_ok=True)
     return final
 
 
 def _download_single(
-    resolved_url: str, final: Path, size: int, cb, cancel: threading.Event | None = None
+    resolved_url: str,
+    final: Path,
+    size: int,
+    cb,
+    cancel: threading.Event | None = None,
+    segment_cb=None,
 ) -> Path:
     """One streamed ``GET`` into ``final``, always from zero - no resume.
 
@@ -379,6 +405,8 @@ def _download_single(
     Used for no-range or unknown-size sources, and as the fallback when a
     segmented run hits ``RangeNotSupported`` mid-flight. A set ``cancel`` event
     raises ``Cancelled``, leaving ``.part`` and the sidecar in place.
+    ``segment_cb``, given, sees a single-element list so callers never have to
+    special-case the fallback path.
     """
     part, meta = _part_path(final), _meta_path(final)
     _check_free_space(part, size)
@@ -410,10 +438,14 @@ def _download_single(
                 if time.monotonic() - last_save >= SAVE_INTERVAL:
                     _save_progress(meta, resolved_url, size, "", [done])
                     _emit(cb, done, size or done, speed)
+                    if segment_cb is not None:
+                        segment_cb([(done, size or done)])
                     last_save = time.monotonic()
     if size and done != size:  # clean EOF short of the promised length
         raise IntegrityError(f"{final.name}: got {done} of {size} bytes; not promoted")
     _emit(cb, done, done, speed)
+    if segment_cb is not None:
+        segment_cb([(done, done)])
     os.replace(part, final)
     meta.unlink(missing_ok=True)
     return final
@@ -425,6 +457,7 @@ def download(
     segments: int = 8,
     progress_cb=None,
     cancel: threading.Event | None = None,
+    segment_cb=None,
 ) -> Path:
     """Download ``url`` into ``dest_dir``, returning the final path.
 
@@ -433,7 +466,9 @@ def download(
     ``RangeNotSupported`` discards the partial download and retries once via the
     single-connection path - it is never re-raised to the caller. A set
     ``cancel`` event raises ``Cancelled``, which propagates to the caller
-    unchanged - it is not an integrity failure.
+    unchanged - it is not an integrity failure. ``segment_cb``, if given, is
+    called with a ``[(done, total), ...]`` list (see ``_download_segmented`` and
+    ``_download_single``); default ``None`` leaves every existing caller unaffected.
     """
     segments = max(1, min(segments, MAX_SEGMENTS))
     dest = Path(dest_dir).resolve()
@@ -443,7 +478,9 @@ def download(
     if dest not in final.resolve().parents or dest not in _part_path(final).resolve().parents:
         raise ValueError("output path escapes dest_dir")
     if not probe.accept_ranges or probe.size <= 0:
-        return _download_single(probe.resolved_url, final, probe.size, progress_cb, cancel)
+        return _download_single(
+            probe.resolved_url, final, probe.size, progress_cb, cancel, segment_cb
+        )
     try:
         return _download_segmented(
             probe.resolved_url,
@@ -453,8 +490,11 @@ def download(
             segments,
             progress_cb,
             cancel,
+            segment_cb,
         )
     except RangeNotSupported:
         _part_path(final).unlink(missing_ok=True)
         _meta_path(final).unlink(missing_ok=True)
-        return _download_single(probe.resolved_url, final, probe.size, progress_cb, cancel)
+        return _download_single(
+            probe.resolved_url, final, probe.size, progress_cb, cancel, segment_cb
+        )

@@ -3,6 +3,7 @@ service and client."""
 
 import os
 import sys
+import time
 from pathlib import Path
 
 
@@ -19,10 +20,25 @@ def state_dir() -> Path:
 
 
 def write_atomic(path: Path, text: str) -> None:
-    """Temp file + ``os.replace``, then best-effort ``chmod 0o600``."""
+    """Temp file + ``os.replace``, then best-effort ``chmod 0o600``.
+
+    On Windows, ``os.replace`` can transiently raise ``PermissionError``
+    ("Access is denied") if another thread/process has ``path`` open for
+    reading at that exact instant - a real race for a file like `queue.json`
+    that a scheduler thread writes while a client reads it concurrently.
+    A short bounded retry absorbs that without changing the atomicity
+    guarantee (the retry is on the rename itself, not a partial write).
+    """
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(text)
-    os.replace(tmp, path)
+    for attempt in range(5):
+        try:
+            os.replace(tmp, path)
+            break
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.01 * (attempt + 1))
     try:
         os.chmod(path, 0o600)
     except OSError:
