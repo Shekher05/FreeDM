@@ -31,6 +31,19 @@ chrome.downloads.onCreated.addListener(async (item) => {
     return;
   }
 
+  let forwardedHeaders;
+  try {
+    const cookies = await chrome.cookies.getAll({ url: item.url });
+    const cookieHeader = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+    forwardedHeaders = {
+      ...(cookieHeader && { Cookie: cookieHeader }),
+      ...(item.referrer && { Referer: item.referrer }),
+      "User-Agent": navigator.userAgent,
+    };
+  } catch {
+    forwardedHeaders = undefined; // cookie lookup failed - fall back to no forwarded headers
+  }
+
   try {
     const flagRes = await fetch(`${BASE}/ext/flag`, {
       method: "POST",
@@ -38,7 +51,10 @@ chrome.downloads.onCreated.addListener(async (item) => {
         "Content-Type": "application/json",
         "X-Ext-Token": token,
       },
-      body: JSON.stringify({ url: item.url }),
+      body: JSON.stringify({
+        url: item.url,
+        ...(forwardedHeaders && { headers: forwardedHeaders }),
+      }),
     });
     if (flagRes.status !== 202) {
       return;

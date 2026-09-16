@@ -53,6 +53,9 @@ class Download:
     mode: str | None = field(default=None, repr=False)
     demoted: bool = field(default=False, repr=False)
     seg_progress: list[tuple[int, int]] | None = field(default=None, repr=False)
+    # RAM-only, deliberately excluded from PERSIST_FIELDS: forwarded auth
+    # headers (e.g. Cookie) must never reach queue.json.
+    headers: dict[str, str] | None = field(default=None, repr=False)
 
 
 class Manager:
@@ -99,7 +102,13 @@ class Manager:
                 continue
             self._downloads[dl.id] = dl
 
-    def add(self, url: str, dest_dir: str | None = None, segments: int = 8) -> str:
+    def add(
+        self,
+        url: str,
+        dest_dir: str | None = None,
+        segments: int = 8,
+        headers: dict[str, str] | None = None,
+    ) -> str:
         netcheck.assert_allowed_url(url)
         dl = Download(
             id=secrets.token_hex(8),
@@ -107,6 +116,7 @@ class Manager:
             dest_dir=str(dest_dir if dest_dir is not None else (self.download_dir or ".")),
             segments=segments,
             state="queued",
+            headers=headers,
         )
         with self._cond:
             self._downloads[dl.id] = dl
@@ -129,6 +139,7 @@ class Manager:
             "id": dl.id,
             "url": strip_credentials(dl.url),
             "filename": dl.filename,
+            "dest_dir": dl.dest_dir,
             "state": dl.state,
             "done": dl.done,
             "total": dl.total,
@@ -162,6 +173,49 @@ class Manager:
             self._persist_locked()
             self._cond.notify_all()
             return True
+
+    @staticmethod
+    def _url_key(url: str) -> tuple[str | None, int | None, str]:
+        """``(hostname, port, path)`` - the parts of a URL that stay fixed
+        across a presigned URL's signature rotating (only the query string
+        changes)."""
+        parts = urlsplit(url)
+        return (parts.hostname, parts.port, parts.path)
+
+    def find_resumable(self, url: str) -> list[Download]:
+        """Paused/errored downloads whose url has the same
+        ``(host, port, path)`` as ``url`` - the identity a presigned URL
+        keeps across a signature rotation. Scoped to non-terminal-but-stalled
+        downloads only, not the whole queue, so this is a targeted match
+        rather than an open-ended scan."""
+        key = self._url_key(url)
+        with self._cond:
+            return [
+                dl for dl in self._downloads.values()
+                if dl.state in ("paused", "error") and self._url_key(dl.url) == key
+            ]
+
+    def rebind(self, id: str, new_url: str, new_resolved_url: str, new_validator: str) -> None:
+        """Point a paused/errored download at a fresh URL (same resource, a
+        rotated signature) and requeue it. Rewrites the on-disk resume
+        sidecar first via ``engine.rebind_progress`` so the requeued run
+        resumes from the existing bytes instead of restarting from zero."""
+        with self._cond:
+            dl = self._downloads.get(id)
+            if dl is None or dl.state not in ("paused", "error"):
+                raise ValueError(f"not resumable: {id!r}")
+            if dl.filename is None:
+                raise ValueError(f"unknown filename for {id!r} - cannot rebind sidecar")
+            final = Path(dl.dest_dir).resolve() / dl.filename
+            engine.rebind_progress(final, new_resolved_url, new_validator)
+            dl.url = new_url
+            dl.state = "queued"
+            dl.demoted = False
+            dl.error = None
+            dl.cancel_event = threading.Event()
+            dl.mode = None
+            self._persist_locked()
+            self._cond.notify_all()
 
     def cancel(self, id: str) -> bool:
         with self._cond:
@@ -209,6 +263,14 @@ class Manager:
                     continue
                 self._cond.wait(timeout=0.5)
 
+    def _on_probed(self, dl: Download):
+        def _set_filename(filename: str) -> None:
+            with self._cond:
+                dl.filename = filename
+                self._persist_locked()
+
+        return _set_filename
+
     def _run(self, dl: Download) -> None:
         host = urlsplit(dl.url).hostname or ""
         segs = min(self._host_caps.get(host, dl.segments), engine.MAX_SEGMENTS)
@@ -220,6 +282,8 @@ class Manager:
                 progress_cb=self._cb(dl),
                 cancel=dl.cancel_event,
                 segment_cb=self._seg_cb(dl),
+                on_probed=self._on_probed(dl),
+                headers=dl.headers,
             )
         except engine.Cancelled:
             self._on_cancelled(dl)
@@ -413,6 +477,13 @@ class _Handler(BaseHTTPRequestHandler):
         if not isinstance(url, str) or not url:
             self._send_json(400, {"error": "missing url"})
             return
+        headers = body.get("headers")
+        if headers is not None and (
+            not isinstance(headers, dict)
+            or not all(isinstance(k, str) and isinstance(v, str) for k, v in headers.items())
+        ):
+            self._send_json(400, {"error": "bad headers"})
+            return
         try:
             netcheck.assert_allowed_url(url)
         except netcheck.BlockedURLError:
@@ -421,8 +492,9 @@ class _Handler(BaseHTTPRequestHandler):
         if self.server.pending is None:
             self._send_json(404, {"error": "not found"})
             return
+        item = (url, headers) if headers else url
         try:
-            self.server.pending.put_nowait(url)
+            self.server.pending.put_nowait(item)
         except queue.Full:
             self._send_json(503, {"error": "busy"})
             return
@@ -643,7 +715,10 @@ def _frame_rows(manager: Manager, watched: dict[str, int]) -> list[dict]:
                 rows.append({"phase": "combining", "name": name, "segments": segs})
                 watched[id_] = 1
             else:
-                rows.append({"phase": state, "name": name, "error": snap.get("error")})
+                rows.append({
+                    "phase": state, "name": name,
+                    "error": snap.get("error"), "dest_dir": snap.get("dest_dir"),
+                })
                 del watched[id_]
         else:
             rows.append(
@@ -667,11 +742,19 @@ def _format_frame(rows: list[dict]) -> list[str]:
         if phase == "combining":
             lines.append(f"combining {len(row['segments'])} segments -> {row['name']}")
         elif phase == "done":
-            lines.append(f"done -> {row['name']}")
+            hint = engine.extension_hint(row["name"])
+            if hint is not None:
+                lines.append(hint)
+            dest_dir = row.get("dest_dir")
+            saved_path = str(Path(dest_dir) / row["name"]) if dest_dir else row["name"]
+            lines.append(f"Saved to {saved_path}")
+            lines.append("Ready for a new link.")
         elif phase == "error":
             lines.append(f"error: {row.get('error') or ''} -> {row['name']}")
+            lines.append("Ready for a new link.")
         elif phase == "cancelled":
             lines.append(f"cancelled -> {row['name']}")
+            lines.append("Ready for a new link.")
         else:
             for i, (d, t) in enumerate(row.get("segments") or []):
                 frac = d / t if t else 1.0
@@ -682,10 +765,26 @@ def _format_frame(rows: list[dict]) -> list[str]:
 
 
 def _render_active(manager: Manager, watched: dict[str, int], last_count: int) -> int:
-    """I/O wrapper: erase the previous frame (ANSI cursor-up + clear-to-end,
-    stdlib escape codes - no dependency) and print the new one. Returns the new
-    line count so the next call knows how far to erase."""
-    lines = _format_frame(_frame_rows(manager, watched))
+    """I/O wrapper: prints any newly-terminal ("combining"/done/error/
+    cancelled) lines permanently via a normal scrolling `print()` - never
+    erased - then erases and redraws only the still-active downloads' live
+    progress lines (ANSI cursor-up + clear-to-end, stdlib escape codes - no
+    dependency). Returns the new live-region line count so the next call
+    knows how far to erase. Keeping the two separate is what stops a
+    just-finished download's completion message from being wiped the moment
+    its id drops out of `watched` on the next tick."""
+    rows = _frame_rows(manager, watched)
+    permanent_rows = [r for r in rows if r["phase"] != "active"]
+    live_rows = [r for r in rows if r["phase"] == "active"]
+
+    if permanent_rows:
+        if last_count:
+            sys.stdout.write(f"\x1b[{last_count}A\x1b[J")
+            last_count = 0
+        for line in _format_frame(permanent_rows):
+            print(line)
+
+    lines = _format_frame(live_rows)
     if last_count:
         sys.stdout.write(f"\x1b[{last_count}A\x1b[J")
     if lines:
@@ -694,26 +793,70 @@ def _render_active(manager: Manager, watched: dict[str, int], last_count: int) -
     return len(lines)
 
 
+def _try_resume(manager: Manager, url: str, headers: dict[str, str] | None) -> str | bool | None:
+    """If `url` looks like a fresh link for a paused/errored download (same
+    host+port+path per `Manager.find_resumable`, confirmed by a live probe's
+    size and Accept-Ranges matching the paused download's), prompt to resume
+    it instead of the plain new-download prompt. Returns the resumed
+    download's id on acceptance, ``False`` if the user explicitly declined a
+    real match (the caller should skip the link entirely, not fall through
+    to a plain add), or ``None`` if there was no safe match (the caller
+    should fall back to a normal `manager.add`)."""
+    candidates = manager.find_resumable(url)
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        print("Multiple paused downloads match this link:")
+        for c in candidates:
+            print(f"  {c.id}: {c.filename or '...'} ({c.dest_dir})")
+        choice = input("  resume which id (blank to start a new download instead)? ").strip()
+        match = next((c for c in candidates if c.id == choice), None)
+        if match is None:
+            return None
+    else:
+        match = candidates[0]
+    try:
+        probe = engine._probe(url, headers)
+    except Exception:  # noqa: BLE001 - any probe failure -> fall back to a normal add
+        return None
+    if probe.size != match.total or not probe.accept_ranges:
+        return None
+    print(f"Found paused download {match.filename or match.id} "
+          f"({match.done}/{match.total} bytes done).")
+    if input("  resume with this link? [y/n] ").strip().lower() != "y":
+        return False
+    manager.rebind(match.id, url, probe.resolved_url, probe.validator)
+    return match.id
+
+
 def _confirm_loop(manager: Manager, pending: "queue.Queue") -> None:
     """Runs on the main thread: ask `y/n` for each flagged URL, in arrival
     order, and redraw the live per-segment/aggregate progress of every
     confirmed-but-unfinished download on each tick. A `None` sentinel exits the
     loop (used at shutdown). `get(timeout=...)` rather than a bare blocking
-    `get` so Ctrl-C can interrupt it on Windows."""
+    `get` so Ctrl-C can interrupt it on Windows. Before the plain
+    new-download prompt, `_try_resume` checks whether the link is a fresh
+    URL for an existing paused/errored download (Approach #3)."""
     watched: dict[str, int] = {}
     last_count = 0
     while True:
         try:
-            url = pending.get(timeout=0.5)
+            item = pending.get(timeout=0.5)
         except queue.Empty:
             last_count = _render_active(manager, watched, last_count)
             continue
-        if url is None:
+        if item is None:
             return
+        url, headers = item if isinstance(item, tuple) else (item, None)
         print(redact(url))
-        if input("  [y/n]? ").strip().lower() == "y":
+        resumed_id = _try_resume(manager, url, headers)
+        if resumed_id is False:
+            pass  # user declined a real resume match - skip this link entirely
+        elif resumed_id is not None:
+            watched[resumed_id] = 0
+        elif input("  [y/n]? ").strip().lower() == "y":
             try:
-                watched[manager.add(url)] = 0
+                watched[manager.add(url, headers=headers)] = 0
             except Exception as exc:  # noqa: BLE001 - one bad link must not kill the loop
                 print(redact(str(exc)))
         last_count = _render_active(manager, watched, last_count)
@@ -754,7 +897,8 @@ def run_catch(origin: str) -> None:
         while not pending.empty():
             leftover = pending.get_nowait()
             if leftover is not None:
-                print(f"unanswered: {redact(leftover)}")
+                url = leftover[0] if isinstance(leftover, tuple) else leftover
+                print(f"unanswered: {redact(url)}")
         manager.shutdown()
         server.shutdown()
         server.server_close()

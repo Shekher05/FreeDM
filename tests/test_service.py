@@ -3,6 +3,7 @@ import os
 import queue
 import threading
 import time
+from pathlib import Path
 
 import pytest
 import requests
@@ -52,6 +53,96 @@ def test_add_rejects_private_url(tmp_path, monkeypatch):
     with pytest.raises(BlockedURLError):
         mgr.add("http://127.0.0.1:9/x")
     assert not (tmp_path / "queue.json").exists()
+
+
+# --- forwarded headers (Approach #2) ---------------------------------------
+
+
+def test_manager_add_accepts_and_forwards_headers(tmp_path, make_server):
+    blob = os.urandom(64 * 1024)
+    server = make_server(blob, require_header=("Cookie", "session=abc"))
+    dl_dir = tmp_path / "dl"
+    mgr = Manager(tmp_path / "queue.json", download_dir=dl_dir)
+    id_ = mgr.add(server.url, headers={"Cookie": "session=abc"})
+    mgr.start()
+    try:
+        snap = _poll(mgr, id_, {"done", "error"}, timeout=15)
+        assert snap["state"] == "done"
+        out = dl_dir / snap["filename"]
+        assert out.read_bytes() == blob
+    finally:
+        mgr.shutdown()
+
+
+def test_manager_add_never_persists_headers(tmp_path, make_server):
+    server = make_server(os.urandom(1024))
+    mgr = Manager(tmp_path / "queue.json", download_dir=tmp_path / "dl")
+    mgr.add(server.url, headers={"Cookie": "session=s3cr3t"})
+    assert "s3cr3t" not in (tmp_path / "queue.json").read_text()
+    assert "s3cr3t" not in json.dumps(mgr.snapshot())
+
+
+def test_manager_error_state_never_leaks_forwarded_headers(tmp_path):
+    mgr = Manager(tmp_path / "queue.json", download_dir=tmp_path / "dl")
+    id_ = mgr.add("http://127.0.0.1:1/unreachable", headers={"Cookie": "session=s3cr3t"})
+    mgr.start()
+    try:
+        snap = _poll(mgr, id_, {"error"}, timeout=10)
+        assert snap["state"] == "error"
+        assert "s3cr3t" not in json.dumps(snap)
+        assert "s3cr3t" not in (tmp_path / "queue.json").read_text()
+    finally:
+        mgr.shutdown()
+
+
+def test_ext_flag_queues_url_and_headers_as_tuple(ext_http):
+    _mgr, base, pending = ext_http
+    r = requests.post(
+        base + "/ext/flag",
+        json={"url": "http://h/f", "headers": {"Cookie": "session=abc"}},
+        headers={"Origin": EXT_ORIGIN, "X-Ext-Token": EXT_TOKEN},
+        timeout=5,
+    )
+    assert r.status_code == 202
+    assert pending.get_nowait() == ("http://h/f", {"Cookie": "session=abc"})
+
+
+def test_ext_flag_without_headers_still_queues_bare_url(ext_http):
+    """Backward compatible with the pre-existing plain-string queue item
+    shape when the extension sends no headers (older extension build, or a
+    site that needs no auth)."""
+    _mgr, base, pending = ext_http
+    r = requests.post(
+        base + "/ext/flag",
+        json={"url": "http://h/f"},
+        headers={"Origin": EXT_ORIGIN, "X-Ext-Token": EXT_TOKEN},
+        timeout=5,
+    )
+    assert r.status_code == 202
+    assert pending.get_nowait() == "http://h/f"
+
+
+def test_ext_flag_rejects_non_dict_headers(ext_http):
+    _mgr, base, pending = ext_http
+    r = requests.post(
+        base + "/ext/flag",
+        json={"url": "http://h/f", "headers": "not-a-dict"},
+        headers={"Origin": EXT_ORIGIN, "X-Ext-Token": EXT_TOKEN},
+        timeout=5,
+    )
+    assert r.status_code == 400
+    assert pending.empty()
+
+
+def test_confirm_loop_forwards_headers_from_tuple_items(tmp_path, monkeypatch):
+    mgr = Manager(tmp_path / "queue.json", download_dir=tmp_path / "dl")
+    pending = queue.Queue()
+    pending.put(("http://h/keep", {"Cookie": "session=abc"}))
+    pending.put(None)
+    monkeypatch.setattr("builtins.input", lambda *a: "y")
+    service._confirm_loop(mgr, pending)
+    dl = next(iter(mgr._downloads.values()))
+    assert dl.headers == {"Cookie": "session=abc"}
 
 
 def test_scheduler_promotes_up_to_max(tmp_path, make_server):
@@ -250,6 +341,106 @@ def test_host_demotion_retries_with_two_segments(tmp_path, make_server):
         mgr.shutdown()
 
 
+# --- resume across presigned-URL rotation (find_resumable / rebind) -------
+
+
+def test_manager_learns_filename_before_pausing(tmp_path, make_server, monkeypatch):
+    """A paused/errored download must already have its filename recorded -
+    rebind needs it to find the .part/sidecar on disk, and it can't wait for
+    "done" since a paused download never reaches that state."""
+    blob = os.urandom(4 * 1024 * 1024)
+    server = make_server(blob)
+    dl_dir = tmp_path / "dl"
+    mgr = Manager(tmp_path / "queue.json", download_dir=dl_dir)
+    id_ = mgr.add(server.url)
+    _wrap_cb_with_trigger(monkeypatch, mgr, lambda m, i: m.pause(i))
+
+    mgr.start()
+    try:
+        _poll(mgr, id_, {"paused"})
+        assert mgr.snapshot_one(id_)["filename"] == "file.bin"
+    finally:
+        mgr.shutdown()
+
+
+def test_find_resumable_matches_host_and_path_ignores_query(tmp_path, make_server):
+    server = make_server(os.urandom(1024))
+    mgr = Manager(tmp_path / "queue.json", download_dir=tmp_path / "dl")
+    id_ = mgr.add(server.url)
+    assert mgr.pause(id_)  # queued -> paused directly, no scheduler needed
+    matches = mgr.find_resumable(server.url + "?sig=fresh")
+    assert [m.id for m in matches] == [id_]
+
+
+def test_find_resumable_ignores_a_different_path(tmp_path, make_server):
+    server = make_server(os.urandom(1024))
+    mgr = Manager(tmp_path / "queue.json", download_dir=tmp_path / "dl")
+    id_ = mgr.add(server.url)
+    mgr.pause(id_)
+    other_path = server.url.replace("/file.bin", "/other.bin")
+    assert mgr.find_resumable(other_path) == []
+
+
+def test_find_resumable_scoped_to_paused_and_error_only(tmp_path, make_server):
+    server = make_server(os.urandom(1024))
+    mgr = Manager(tmp_path / "queue.json", download_dir=tmp_path / "dl")
+    mgr.add(server.url)  # left "queued" - not a resume candidate
+    assert mgr.find_resumable(server.url + "?sig=fresh") == []
+
+
+def test_rebind_rejects_non_resumable_state(tmp_path, make_server):
+    server = make_server(os.urandom(1024))
+    mgr = Manager(tmp_path / "queue.json", download_dir=tmp_path / "dl")
+    id_ = mgr.add(server.url)  # queued, not paused/error
+    with pytest.raises(ValueError):
+        mgr.rebind(id_, server.url + "?sig=x", server.url + "?sig=x", '"e"')
+
+
+def test_rebind_unknown_id_raises(tmp_path):
+    mgr = Manager(tmp_path / "queue.json", download_dir=tmp_path / "dl")
+    with pytest.raises(ValueError):
+        mgr.rebind("nope", "http://h/f", "http://h/f", '"e"')
+
+
+def test_rebind_resumes_using_existing_bytes_after_url_rotation(
+    tmp_path, make_server, monkeypatch
+):
+    """The end-to-end scenario Approach #3 exists for: a presigned URL
+    expires mid-download, the user re-clicks to get a fresh one (same
+    host+path, different signature query), and TDM resumes from the exact
+    byte offset instead of restarting."""
+    from tdm.engine import _probe
+
+    blob = os.urandom(4 * 1024 * 1024)
+    server = make_server(blob)
+    dl_dir = tmp_path / "dl"
+    mgr = Manager(tmp_path / "queue.json", download_dir=dl_dir)
+    id_ = mgr.add(server.url)
+    _wrap_cb_with_trigger(monkeypatch, mgr, lambda m, i: m.pause(i))
+
+    mgr.start()
+    try:
+        _poll(mgr, id_, {"paused"})
+        assert (dl_dir / "file.bin.part").exists()
+
+        fresh_url = server.url + "?sig=fresh"
+        candidates = mgr.find_resumable(fresh_url)
+        assert [c.id for c in candidates] == [id_]
+
+        probe = _probe(fresh_url)
+        mgr.rebind(id_, fresh_url, probe.resolved_url, probe.validator)
+        assert mgr.snapshot_one(id_)["state"] == "queued"
+
+        server.served_bytes = 0
+        snap = _poll(mgr, id_, {"done", "error"}, timeout=15)
+        assert snap["state"] == "done"
+        out = dl_dir / snap["filename"]
+        assert out.read_bytes() == blob
+        assert server.served_bytes < len(blob)  # resumed, not re-downloaded from scratch
+    finally:
+        mgr.shutdown()
+
+
 # --- restart recovery (Milestone 2 Task 7) ---------------------------------
 
 
@@ -380,7 +571,9 @@ def test_post_downloads_creates_and_lists(http, make_server):
     entries = r.json()
     assert any(e["id"] == id_ for e in entries)
     entry = next(e for e in entries if e["id"] == id_)
-    assert set(entry) == {"id", "url", "filename", "state", "done", "total", "bps", "error"}
+    assert set(entry) == {
+        "id", "url", "filename", "dest_dir", "state", "done", "total", "bps", "error",
+    }
 
     r = requests.get(f"{base}/downloads/{id_}", headers=_auth(), timeout=5)
     assert r.status_code == 200
@@ -693,6 +886,75 @@ def test_confirm_loop_accepts_y_skips_n(tmp_path, monkeypatch):
     assert mgr.snapshot()[0]["url"] == "http://h/keep"
 
 
+def test_confirm_loop_resumes_matching_paused_download(tmp_path, make_server, monkeypatch):
+    """The #3 catch-mode UX: a flagged link matching a paused download's
+    host+path gets a resume prompt instead of a plain new-download prompt,
+    and accepting it rebinds and requeues rather than starting over."""
+    blob = os.urandom(4 * 1024 * 1024)
+    server = make_server(blob)
+    dl_dir = tmp_path / "dl"
+    mgr = Manager(tmp_path / "queue.json", download_dir=dl_dir)
+    id_ = mgr.add(server.url)
+    _wrap_cb_with_trigger(monkeypatch, mgr, lambda m, i: m.pause(i))
+
+    mgr.start()
+    try:
+        _poll(mgr, id_, {"paused"})
+
+        pending = queue.Queue()
+        pending.put(server.url + "?sig=fresh")
+        pending.put(None)
+        monkeypatch.setattr("builtins.input", lambda *a: "y")  # accept the resume prompt
+        server.served_bytes = 0
+        service._confirm_loop(mgr, pending)
+
+        assert len(mgr.snapshot()) == 1  # rebound in place, not a second download
+        snap = _poll(mgr, id_, {"done", "error"}, timeout=15)
+        assert snap["state"] == "done"
+        assert (dl_dir / snap["filename"]).read_bytes() == blob
+        assert server.served_bytes < len(blob)  # resumed, not re-downloaded from scratch
+    finally:
+        mgr.shutdown()
+
+
+def test_confirm_loop_skips_link_when_resume_declined(tmp_path, make_server, monkeypatch):
+    blob = os.urandom(4 * 1024 * 1024)
+    server = make_server(blob)
+    dl_dir = tmp_path / "dl"
+    mgr = Manager(tmp_path / "queue.json", download_dir=dl_dir)
+    id_ = mgr.add(server.url)
+    _wrap_cb_with_trigger(monkeypatch, mgr, lambda m, i: m.pause(i))
+
+    mgr.start()
+    try:
+        _poll(mgr, id_, {"paused"})
+
+        pending = queue.Queue()
+        pending.put(server.url + "?sig=fresh")
+        pending.put(None)
+        monkeypatch.setattr("builtins.input", lambda *a: "n")  # decline the resume prompt
+        service._confirm_loop(mgr, pending)
+
+        assert len(mgr.snapshot()) == 1  # no second download queued
+        assert mgr.snapshot_one(id_)["state"] == "paused"  # left untouched
+    finally:
+        mgr.shutdown()
+
+
+def test_confirm_loop_falls_back_to_new_download_with_no_resumable_match(
+    tmp_path, make_server, monkeypatch
+):
+    server = make_server(os.urandom(1024))
+    mgr = Manager(tmp_path / "queue.json", download_dir=tmp_path / "dl")
+    pending = queue.Queue()
+    pending.put(server.url)
+    pending.put(None)
+    monkeypatch.setattr("builtins.input", lambda *a: "y")
+    service._confirm_loop(mgr, pending)
+    assert len(mgr.snapshot()) == 1
+    assert mgr.snapshot()[0]["url"] == server.url
+
+
 def test_confirm_loop_survives_bad_url(tmp_path, monkeypatch):
     monkeypatch.setattr(netcheck, "assert_allowed_url", _real_assert_allowed_url)
     mgr = Manager(tmp_path / "queue.json", download_dir=tmp_path / "dl")
@@ -799,17 +1061,45 @@ def test_format_frame_renders_active_segments_and_aggregate():
     assert " 40%" in lines[2]
 
 
+def test_format_frame_appends_extension_hint_for_a_nameless_done_download():
+    lines = service._format_frame(
+        [{"phase": "done", "name": "download.bin", "dest_dir": "/out"}]
+    )
+    assert "no file extension" in lines[0]
+    assert lines[1] == f"Saved to {Path('/out') / 'download.bin'}"
+    assert lines[2] == "Ready for a new link."
+
+
 def test_format_frame_terminal_phases():
-    assert service._format_frame([{"phase": "done", "name": "a.bin"}]) == ["done -> a.bin"]
+    assert service._format_frame(
+        [{"phase": "done", "name": "a.bin", "dest_dir": "/out"}]
+    ) == [f"Saved to {Path('/out') / 'a.bin'}", "Ready for a new link."]
     assert service._format_frame(
         [{"phase": "error", "name": "a.bin", "error": "boom"}]
-    ) == ["error: boom -> a.bin"]
+    ) == ["error: boom -> a.bin", "Ready for a new link."]
     assert service._format_frame([{"phase": "cancelled", "name": "a.bin"}]) == [
-        "cancelled -> a.bin"
+        "cancelled -> a.bin", "Ready for a new link."
     ]
     assert service._format_frame(
         [{"phase": "combining", "name": "a.bin", "segments": [(1, 1), (1, 1)]}]
     ) == ["combining 2 segments -> a.bin"]
+
+
+def test_render_active_never_erases_a_just_announced_completion(capsys):
+    """Approach: completion lines (hint/Saved to/Ready-for-a-new-link) must
+    scroll permanently, not live inside the erasable progress region - or the
+    next redraw tick wipes them the moment the id drops out of `watched`."""
+    mgr = _FakeManager(
+        {"a": {"state": "done", "filename": "a.bin", "dest_dir": "/out", "error": None}}
+    )
+    watched = {"a": 1}  # already past the one-tick "combining" phase
+    last_count = service._render_active(mgr, watched, last_count=0)
+
+    assert watched == {}  # announced and dropped
+    assert last_count == 0  # nothing live left - the erasable region is empty
+    out = capsys.readouterr().out
+    assert f"Saved to {Path('/out') / 'a.bin'}" in out
+    assert "Ready for a new link." in out
 
 
 class _FakeManager:
@@ -835,7 +1125,7 @@ def test_frame_rows_holds_combining_one_extra_tick_then_drops():
     assert watched == {"a": 1}
 
     rows2 = service._frame_rows(mgr, watched)
-    assert rows2 == [{"phase": "done", "name": "a.bin", "error": None}]
+    assert rows2 == [{"phase": "done", "name": "a.bin", "error": None, "dest_dir": None}]
     assert watched == {}
 
 

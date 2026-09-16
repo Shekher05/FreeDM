@@ -14,6 +14,16 @@ def test_cli_downloads_file(make_server, tmp_path, capsys):
     assert (tmp_path / "file.bin").read_bytes() == blob
 
 
+def test_cli_shows_extension_hint_for_a_nameless_download(make_server, tmp_path, capsys):
+    server = make_server(os.urandom(1024))
+    root_url = f"http://127.0.0.1:{server.server_address[1]}/"  # no path segment -> no filename
+    rc = main([root_url, "-o", str(tmp_path), "-n", "1"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Saved to" in out
+    assert "no file extension" in out
+
+
 def test_cli_bad_url_returns_2(tmp_path, capsys):
     rc = main(["http://127.0.0.1:1/nope", "-o", str(tmp_path)])
     assert rc == 2

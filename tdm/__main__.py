@@ -10,7 +10,7 @@ import argparse
 import json
 import sys
 
-from tdm.engine import download
+from tdm.engine import download, extension_hint
 from tdm.redact import redact
 
 _redact = redact  # kept for tests/test_cli.py's existing import name
@@ -161,6 +161,9 @@ def _one_shot(argv: list[str] | None) -> int:
         return 2
     sys.stderr.write("\n")
     print(f"Saved to {path}")
+    hint = extension_hint(path.name)
+    if hint is not None:
+        print(hint)
     return 0
 
 

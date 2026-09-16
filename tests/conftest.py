@@ -17,6 +17,15 @@ milestone-1 plan (Revision 2):
 - `segment_status=<code>` — the first `Range` request the server sees answers
   with `<code>` and an empty body (one-shot), then normal service resumes
   (exercises Manager host demotion).
+- `silent_drop_after=<n>` — the first `Range` response writes only `n` body
+  bytes and omits `Content-Length` entirely, then the connection closes
+  (one-shot; normal service resumes after). Unlike `drop_after` (which still
+  declares the full `Content-Length` and so makes `requests` raise on the
+  mismatch), this is a *clean* short close with no length promise broken -
+  the real-world "server FIN's the socket early, no exception raised" case.
+- `require_header=(name, value)` — every request must carry header `name`
+  set to exactly `value` or the server answers `403` with no body; used to
+  prove a caller-supplied `headers` dict actually reaches the wire.
 """
 import http.server
 import threading
@@ -55,6 +64,12 @@ class _RangeHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        req = self.server.require_header
+        if req is not None and self.headers.get(req[0]) != req[1]:
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         data = self.server.data
         rng = self.headers.get("Range")
         if rng and self.server.support_range:
@@ -72,6 +87,15 @@ class _RangeHandler(http.server.BaseHTTPRequestHandler):
             if self.server.ignore_range_end:
                 end = len(data) - 1  # honours start, ignores the requested end
             body = data[start : end + 1]
+            is_probe = start == 0 and end == 0  # the 1-byte accept-ranges probe - not a real segment
+            silent = None if is_probe else self.server.take_silent_drop()
+            if silent is not None:
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
+                self._shared_headers()  # no Content-Length: body ends when the socket closes
+                self.end_headers()
+                self.wfile.write(body[:silent])
+                return
             self.send_response(206)
             self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
         else:
@@ -86,7 +110,8 @@ class _RangeHandler(http.server.BaseHTTPRequestHandler):
 class _Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, data, support_range, no_etag, drop_after, ignore_range_end, segment_status=None):
+    def __init__(self, data, support_range, no_etag, drop_after, ignore_range_end,
+                 segment_status=None, silent_drop_after=None, require_header=None):
         super().__init__(("127.0.0.1", 0), _RangeHandler)
         self.data = data
         self.support_range = support_range
@@ -94,6 +119,8 @@ class _Server(http.server.ThreadingHTTPServer):
         self.ignore_range_end = ignore_range_end
         self._drop_after = drop_after
         self.segment_status = segment_status
+        self._silent_drop_after = silent_drop_after
+        self.require_header = require_header
         self._lock = threading.Lock()
         self.served_bytes = 0
 
@@ -103,6 +130,14 @@ class _Server(http.server.ThreadingHTTPServer):
         with self._lock:
             status, self.segment_status = self.segment_status, None
             return status
+
+    def take_silent_drop(self):
+        """One-shot: the first Range request after this is armed gets a
+        Content-Length-less short write (clean close, no exception), then
+        normal service resumes."""
+        with self._lock:
+            n, self._silent_drop_after = self._silent_drop_after, None
+            return n
 
     def take_body(self, body):
         """Bytes to actually write for one response: a one-shot `drop_after`
@@ -126,8 +161,10 @@ def make_server():
 
     def _make(data: bytes, support_range: bool = True, no_etag: bool = False,
               drop_after: int | None = None, ignore_range_end: bool = False,
-              segment_status: int | None = None) -> _Server:
-        server = _Server(data, support_range, no_etag, drop_after, ignore_range_end, segment_status)
+              segment_status: int | None = None, silent_drop_after: int | None = None,
+              require_header: tuple[str, str] | None = None) -> _Server:
+        server = _Server(data, support_range, no_etag, drop_after, ignore_range_end,
+                          segment_status, silent_drop_after, require_header)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         servers.append(server)
         return server

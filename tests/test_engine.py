@@ -78,6 +78,21 @@ def test_derive_filename_rejects_windows_reserved():
     assert derive_filename("http://h/", resp) == "download.bin"
 
 
+def test_extension_hint_none_for_a_known_extension():
+    assert engine.extension_hint("movie.mp4") is None
+    assert engine.extension_hint("photo.png") is None
+
+
+def test_extension_hint_fires_on_derive_filenames_fallback():
+    hint = engine.extension_hint("download.bin")
+    assert hint is not None
+    assert ".mp4" in hint and ".jpeg" in hint
+
+
+def test_extension_hint_fires_on_no_extension_at_all():
+    assert engine.extension_hint("report") is not None
+
+
 def test_split_ranges_even():
     assert split_ranges(100, 4) == [(0, 24), (25, 49), (50, 74), (75, 99)]
 
@@ -166,6 +181,33 @@ def test_sidecar_never_persists_credentials(tmp_path):
     assert _load_progress(meta, "http://user:s3cret@h/f", 100, "e") == [0]
 
 
+def test_rebind_progress_updates_identity_keeps_progress(tmp_path):
+    """A presigned URL's signature rotates (host+path unchanged, query
+    differs) - rebind must point the sidecar at the fresh url/etag while
+    leaving the saved per-segment progress untouched, so the next
+    `engine.download()` call trusts it and resumes instead of restarting."""
+    final = tmp_path / "f.bin"
+    meta = _meta_path(final)
+    _save_progress(meta, "http://h/f?sig=old", 100, '"old-etag"', [10, 20, 0])
+    engine.rebind_progress(final, "http://h/f?sig=new", '"new-etag"')
+    assert _load_progress(meta, "http://h/f?sig=new", 100, '"new-etag"') == [10, 20, 0]
+    assert _load_progress(meta, "http://h/f?sig=old", 100, '"old-etag"') is None
+
+
+def test_rebind_progress_strips_credentials_from_new_url(tmp_path):
+    final = tmp_path / "f.bin"
+    meta = _meta_path(final)
+    _save_progress(meta, "http://h/f", 100, '"e1"', [5])
+    engine.rebind_progress(final, "http://user:s3cret@h/f?sig=new", '"e2"')
+    assert "s3cret" not in meta.read_text()
+    assert _load_progress(meta, "http://user:s3cret@h/f?sig=new", 100, '"e2"') == [5]
+
+
+def test_rebind_progress_missing_sidecar_raises(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        engine.rebind_progress(tmp_path / "nope.bin", "http://h/f", '"e"')
+
+
 # --- make_server fixture behaviour (Task 3) --------------------------------
 
 
@@ -224,6 +266,56 @@ def test_probe_no_range_server(make_server):
 def test_probe_no_strong_validator(make_server):
     server = make_server(b"z" * 200, no_etag=True)
     assert _probe(server.url).validator == ""
+
+
+# --- forwarded headers (Approach #2) ---------------------------------------
+
+
+def test_probe_forwards_extra_headers(make_server):
+    server = make_server(b"z" * 200, require_header=("Cookie", "session=abc"))
+    with pytest.raises(requests.exceptions.HTTPError):
+        _probe(server.url)
+    r = _probe(server.url, headers={"Cookie": "session=abc"})
+    assert r.size == 200
+
+
+def test_download_segmented_forwards_headers(make_server, tmp_path):
+    blob = os.urandom(64 * 1024)
+    server = make_server(blob, require_header=("Cookie", "session=abc"))
+    p = _probe(server.url, headers={"Cookie": "session=abc"})
+    out = _download_segmented(
+        p.resolved_url, tmp_path / p.filename, p.size, p.validator, 4, None,
+        headers={"Cookie": "session=abc"},
+    )
+    assert out.read_bytes() == blob
+
+
+def test_download_single_forwards_headers(make_server, tmp_path):
+    blob = os.urandom(1024)
+    server = make_server(blob, support_range=False, require_header=("Cookie", "session=abc"))
+    p = _probe(server.url, headers={"Cookie": "session=abc"})
+    out = _download_single(
+        p.resolved_url, tmp_path / p.filename, p.size, None,
+        headers={"Cookie": "session=abc"},
+    )
+    assert out.read_bytes() == blob
+
+
+def test_download_end_to_end_forwards_headers(make_server, tmp_path):
+    blob = os.urandom(64 * 1024)
+    server = make_server(blob, require_header=("Cookie", "session=abc"))
+    out = download(server.url, tmp_path, segments=2, headers={"Cookie": "session=abc"})
+    assert out.read_bytes() == blob
+
+
+def test_forwarded_headers_do_not_leak_into_connection_errors():
+    """The hardening requirement from NewChanges.md #2: a forwarded secret
+    must never end up embedded in an exception's string representation -
+    that string is what `service.py` persists into `dl.error`."""
+    secret = "s3cr3t-cookie-value"
+    with pytest.raises(requests.exceptions.RequestException) as exc_info:
+        _probe("http://127.0.0.1:1/unreachable", headers={"Cookie": f"session={secret}"})
+    assert secret not in str(exc_info.value)
 
 
 def test_probe_rejects_non_http_redirect(monkeypatch):
@@ -295,6 +387,17 @@ def test_segmented_retries_past_a_dropped_connection(make_server, tmp_path):
     assert _seg(server, tmp_path, 4).read_bytes() == blob
 
 
+def test_segmented_retries_past_a_silent_clean_close(make_server, tmp_path):
+    """A server that closes the connection cleanly mid-segment - no
+    Content-Length promise broken, no exception raised by `requests` - must
+    not be mistaken for a successful, short segment. `_download_segment`
+    must detect the short write and retry it until the segment is
+    byte-complete, the same way it already does for a dropped connection."""
+    blob = os.urandom(512 * 1024)
+    server = make_server(blob, silent_drop_after=1000)
+    assert _seg(server, tmp_path, 4).read_bytes() == blob
+
+
 def test_segmented_clamps_a_server_that_ignores_the_range_end(make_server, tmp_path):
     # Server honours `start` but sends the whole tail for every segment request.
     # Each segment must write only into its own slot, or it overruns the next one.
@@ -306,13 +409,18 @@ def test_segmented_clamps_a_server_that_ignores_the_range_end(make_server, tmp_p
     assert not _meta_path(out).exists()
 
 
-def test_segmented_integrity_gate_trips_on_short_download(make_server, tmp_path):
+def test_segmented_integrity_gate_trips_on_short_download(make_server, tmp_path, monkeypatch):
+    # No real backoff delay: every attempt hits the same permanently-short body.
+    monkeypatch.setattr(engine.time, "sleep", lambda *_: None)
     blob = os.urandom(64 * 1024)
     server = make_server(blob)
     p = _probe(server.url)
     final = tmp_path / p.filename
-    # Claim 100 bytes more than the server has: segments can never fill.
-    with pytest.raises(IntegrityError):
+    # Claim 100 bytes more than the server has: the segment can never fill,
+    # so it retries to exhaustion and raises _ShortRead - the same defect
+    # the aggregate integrity gate used to be the only thing catching, now
+    # caught per-segment instead (see test_segmented_retries_past_a_silent_clean_close).
+    with pytest.raises(engine._ShortRead):
         _download_segmented(p.resolved_url, final, p.size + 100, p.validator, 1, None)
     assert _part_path(final).exists()
     assert _meta_path(final).exists()
